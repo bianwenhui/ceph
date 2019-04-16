@@ -17,24 +17,35 @@ else:
 
 from distutils.ccompiler import new_compiler
 from distutils.errors import CompileError, LinkError
-from distutils.sysconfig import customize_compiler
+import distutils.sysconfig
+
+unwrapped_customize = distutils.sysconfig.customize_compiler
+
+clang = False
+
+def filter_unsupported_flags(flags):
+    if clang:
+        return [f for f in flags if not (f == '-mcet' or
+                                         f.startswith('-fcf-protection') or
+                                         f == '-fstack-clash-protection')]
+    else:
+        return flags
+
+def monkey_with_compiler(compiler):
+    unwrapped_customize(compiler)
+    if compiler.compiler_type == 'unix':
+        if compiler.compiler[0].find('clang') != -1:
+            global clang
+            clang = True
+            compiler.compiler = filter_unsupported_flags(compiler.compiler)
+            compiler.compiler_so = filter_unsupported_flags(
+                compiler.compiler_so)
+
+distutils.sysconfig.customize_compiler = monkey_with_compiler
 
 # PEP 440 versioning of the Rados package on PyPI
 # Bump this version, after every changeset
-# NOTE: This version is not the same as get_ceph_version()
-
 __version__ = '2.0.0'
-
-
-def get_ceph_version():
-    try:
-        for line in open(os.path.join(os.path.dirname(__file__), "..", "..", "ceph_ver.h")):
-            if "CEPH_GIT_NICE_VER" in line:
-                return line.split()[2].strip('"')
-        else:
-            return "0"
-    except IOError:
-        return "0"
 
 
 def get_python_flags():
@@ -48,17 +59,15 @@ def get_python_flags():
 
     python_config = python + '-config'
 
-    for cflag in subprocess.check_output(
-            [python_config, "--cflags"]
-    ).strip().decode('utf-8').split():
+    for cflag in filter_unsupported_flags(subprocess.check_output(
+            [python_config, "--cflags"]).strip().decode('utf-8').split()):
         if cflag.startswith('-I'):
             cflags['I'].append(cflag.replace('-I', ''))
         else:
             cflags['extras'].append(cflag)
 
-    for ldflag in subprocess.check_output(
-            [python_config, "--ldflags"]
-    ).strip().decode('utf-8').split():
+    for ldflag in filter_unsupported_flags(subprocess.check_output(
+            [python_config, "--ldflags"]).strip().decode('utf-8').split()):
         if ldflag.startswith('-l'):
             ldflags['l'].append(ldflag.replace('-l', ''))
         if ldflag.startswith('-L'):
@@ -98,9 +107,9 @@ def check_sanity():
         fp.write(dummy_prog)
 
     compiler = new_compiler()
-    customize_compiler(compiler)
+    distutils.sysconfig.customize_compiler(compiler)
 
-    if {'MAKEFLAGS', 'MFLAGS', 'MAKELEVEL'}.issubset(set(os.environ.keys())):
+    if {'MAKEFLAGS', 'MAKELEVEL'}.issubset(set(os.environ.keys())):
         # The setup.py has been invoked by a top-level Ceph make.
         # Set the appropriate CFLAGS and LDFLAGS
 
@@ -131,7 +140,11 @@ def check_sanity():
         shutil.rmtree(tmp_dir)
 
 
-if not check_sanity():
+if 'BUILD_DOC' in os.environ.keys():
+    pass
+elif check_sanity():
+    pass
+else:
     sys.exit(1)
 
 cmdclass = {}
@@ -187,7 +200,9 @@ setup(
                 libraries=["rados"] + flags['ldflags']['l'],
                 extra_compile_args=flags['cflags']['extras'] + flags['ldflags']['extras'],
             )
-        ], build_dir=os.environ.get("CYTHON_BUILD_DIR", None)
+        ],
+        compiler_directives={'language_level': sys.version_info.major},
+        build_dir=os.environ.get("CYTHON_BUILD_DIR", None)
     ),
     classifiers=[
         'Intended Audience :: Developers',

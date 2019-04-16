@@ -84,11 +84,17 @@
 /* Define if you have res_nquery */
 #cmakedefine HAVE_RES_NQUERY
 
-/* Defined if you don't have atomic_ops */
-#cmakedefine NO_ATOMIC_OPS
+/* Defined if you have LZ4 */
+#cmakedefine HAVE_LZ4
+
+/* Defined if you have BROTLI */
+#cmakedefine HAVE_BROTLI
 
 /* Defined if you have libaio */
 #cmakedefine HAVE_LIBAIO
+
+/* Defind if you have POSIX AIO */
+#cmakedefine HAVE_POSIXAIO
 
 /* Defined if OpenLDAP enabled */
 #cmakedefine HAVE_OPENLDAP
@@ -102,38 +108,69 @@
 /* SPDK conditional compilation */
 #cmakedefine HAVE_SPDK
 
+/* DPDK conditional compilation */
+#cmakedefine HAVE_DPDK
+
+/* PMEM conditional compilation */
+#cmakedefine HAVE_PMEM
+
 /* Defined if LevelDB supports bloom filters */
 #cmakedefine HAVE_LEVELDB_FILTER_POLICY
-
-/* Define to 1 if you have the <gperftools/heap-profiler.h> header file. */
-#cmakedefine HAVE_GPERFTOOLS_HEAP_PROFILER_H 1
-
-/* Define to 1 if you have the <gperftools/malloc_extension.h> header file. */
-#cmakedefine HAVE_GPERFTOOLS_MALLOC_EXTENSION_H 1
-
-/* Define to 1 if you have the <gperftools/profiler.h> header file. */
-#cmakedefine HAVE_GPERFTOOLS_PROFILER_H 1
 
 /* Define if you have tcmalloc */
 #cmakedefine HAVE_LIBTCMALLOC
 
-/* Define if you have jemalloc */
-#cmakedefine HAVE_LIBJEMALLOC
-
 /* Define if have curl_multi_wait() */
 #cmakedefine HAVE_CURL_MULTI_WAIT 1
-
-/* Define if using CryptoPP. */
-#cmakedefine USE_CRYPTOPP
 
 /* Define if using NSS. */
 #cmakedefine USE_NSS
 
+/* Define if using OpenSSL. */
+#cmakedefine USE_OPENSSL
+
 /* Accelio conditional compilation */
 #cmakedefine HAVE_XIO
 
+
+/* AsyncMessenger RDMA conditional compilation */
+#cmakedefine HAVE_RDMA
+
+/* ibverbs experimental conditional compilation */
+#cmakedefine HAVE_IBV_EXP
+
+/* define if bluestore enabled */
+#cmakedefine WITH_BLUESTORE
+
+/* define if cephfs enabled */
+#cmakedefine WITH_CEPHFS
+
+/*define if GSSAPI/KRB5 enabled */
+#cmakedefine HAVE_GSSAPI
+
+/* define if rbd enabled */
+#cmakedefine WITH_RBD
+
+/* define if kernel rbd enabled */
+#cmakedefine WITH_KRBD
+
+/* define if key-value-store is enabled */
+#cmakedefine WITH_KVS
+
 /* define if radosgw enabled */
 #cmakedefine WITH_RADOSGW
+
+/* define if radosgw enabled */
+#cmakedefine WITH_RADOSGW_FCGI_FRONTEND
+
+/* define if leveldb is enabled */
+#cmakedefine WITH_LEVELDB
+
+/* define if radosgw's beast frontend enabled */
+#cmakedefine WITH_RADOSGW_BEAST_FRONTEND
+
+/* define if radosgw has openssl support */
+#cmakedefine WITH_CURL_OPENSSL
 
 /* define if HAVE_THREAD_SAFE_RES_QUERY */
 #cmakedefine HAVE_THREAD_SAFE_RES_QUERY
@@ -143,6 +180,9 @@
 
 /* Define if you want to use LTTng */
 #cmakedefine WITH_LTTNG
+
+/* Define if you want to OSD function instrumentation */
+#cmakedefine WITH_OSD_INSTRUMENT_FUNCTIONS
 
 /* Define if you want to use Babeltrace */
 #cmakedefine WITH_BABELTRACE
@@ -174,23 +214,14 @@
 /* LTTng is disabled, so define this macro to be nothing. */
 #cmakedefine tracepoint
 
-/* have boost::asio::coroutine */
-#cmakedefine HAVE_BOOST_ASIO_COROUTINE
-
 /* Define to 1 if you have fdatasync. */
 #cmakedefine HAVE_FDATASYNC 1
-
-/* Define to 1 if you have the <inttypes.h> header file. */
-#cmakedefine HAVE_INTTYPES_H 1
 
 /* Defined if you have librocksdb enabled */
 #cmakedefine HAVE_LIBROCKSDB
 
 /* Define to 1 if you have the <valgrind/helgrind.h> header file. */
 #cmakedefine HAVE_VALGRIND_HELGRIND_H 1
-
-/* Define to 1 if you have the <stdint.h> header file. */
-#cmakedefine HAVE_STDINT_H 1
 
 /* Define to 1 if you have the <sys/prctl.h> header file. */
 #cmakedefine HAVE_SYS_PRCTL_H 1
@@ -234,14 +265,11 @@
 /* Defined if you have libzfs enabled */
 #cmakedefine HAVE_LIBZFS
 
-/* Define if the C complier supports __func__ */
+/* Define if the C compiler supports __func__ */
 #cmakedefine HAVE_FUNC
 
-/* Define if the C complier supports __PRETTY_FUNCTION__ */
+/* Define if the C compiler supports __PRETTY_FUNCTION__ */
 #cmakedefine HAVE_PRETTY_FUNC
-
-/* F_SETPIPE_SZ is supported */
-#cmakedefine CEPH_HAVE_SETPIPE_SZ
 
 /* Have eventfd extension. */
 #cmakedefine HAVE_EVENTFD
@@ -254,6 +282,12 @@
 
 /* Support ARMv8 CRC instructions */
 #cmakedefine HAVE_ARMV8_CRC
+
+/* Support ARMv8 CRYPTO instructions */
+#cmakedefine HAVE_ARMV8_CRYPTO
+
+/* Support ARMv8 CRC and CRYPTO intrinsics */
+#cmakedefine HAVE_ARMV8_CRC_CRYPTO_INTRINSICS
 
 /* Define if you have struct stat.st_mtimespec.tv_nsec */
 #cmakedefine HAVE_STAT_ST_MTIMESPEC_TV_NSEC
@@ -270,10 +304,57 @@
 /* Defined if pthread_setname_np() is available */
 #cmakedefine HAVE_PTHREAD_SETNAME_NP 1
 
+/* Defined if pthread_rwlockattr_setkind_np() is available */
+#cmakedefine HAVE_PTHREAD_RWLOCKATTR_SETKIND_NP
+
+/* Defined if blkin enabled */
+#cmakedefine WITH_BLKIN
+
 /* Defined if pthread_set_name_np() is available */
 #cmakedefine HAVE_PTHREAD_SET_NAME_NP
 
 /* Defined if pthread_getname_np() is available */
 #cmakedefine HAVE_PTHREAD_GETNAME_NP 1
+
+/* Support POWER8 instructions */
+#cmakedefine HAVE_POWER8
+
+/* Define if endian type is big endian */
+#cmakedefine CEPH_BIG_ENDIAN
+
+/* Define if endian type is little endian */
+#cmakedefine CEPH_LITTLE_ENDIAN
+
+#cmakedefine PYTHON_EXECUTABLE "@MGR_PYTHON_EXECUTABLE@"
+
+/* Define to 1 if you have the `getprogname' function. */
+#cmakedefine HAVE_GETPROGNAME 1
+
+/* Defined if getentropy() is available */
+#cmakedefine HAVE_GETENTROPY
+
+/* Defined if boost::context is available */
+#cmakedefine HAVE_BOOST_CONTEXT
+
+/* Defined if libradosstriper is enabled: */
+#cmakedefine WITH_LIBRADOSSTRIPER
+
+/* Defined if OpenSSL is available for the rgw beast frontend */
+#cmakedefine WITH_RADOSGW_BEAST_OPENSSL
+
+/* Defined if rabbitmq-c is available for rgw amqp push endpoint */
+#cmakedefine WITH_RADOSGW_AMQP_ENDPOINT
+
+/* Defined if std::map::merge() is supported */
+#cmakedefine HAVE_STDLIB_MAP_SPLICING
+
+/* Defined if Intel QAT compress/decompress is supported */
+#cmakedefine HAVE_QATZIP
+
+/* Define if seastar is available. */
+#cmakedefine HAVE_SEASTAR
+
+/* Define if unit tests are built. */
+#cmakedefine UNIT_TESTS_BUILT
 
 #endif /* CONFIG_H */

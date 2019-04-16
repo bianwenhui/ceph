@@ -4,13 +4,12 @@
 #ifndef __CEPH_OSD_CHAIN_XATTR_H
 #define __CEPH_OSD_CHAIN_XATTR_H
 
-#include "common/xattr.h"
-#include "include/assert.h"
-#include "include/buffer.h"
-#include <string.h>
-#include <stdio.h>
-
+#include "include/compat.h"
 #include <errno.h>
+#include <stdio.h>
+#include "common/xattr.h"
+#include "include/ceph_assert.h"
+#include "include/buffer_fwd.h"
 
 #if defined(__linux__)
 #include <linux/limits.h>
@@ -114,7 +113,7 @@ int chain_setxattr(
     pos  += chunk_size;
     ret = pos;
     i++;
-    assert(size == 0 || !ensure_single_attr);
+    ceph_assert(size == 0 || !ensure_single_attr);
   } while (size);
 
   if (ret >= 0 && !skip_chain_cleanup) {
@@ -158,7 +157,7 @@ int chain_fsetxattr(
     pos  += chunk_size;
     ret = pos;
     i++;
-    assert(size == 0 || !ensure_single_attr);
+    ceph_assert(size == 0 || !ensure_single_attr);
   } while (size);
 
   if (ret >= 0 && !skip_chain_cleanup) {

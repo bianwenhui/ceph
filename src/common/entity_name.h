@@ -15,12 +15,8 @@
 #ifndef CEPH_COMMON_ENTITY_NAME_H
 #define CEPH_COMMON_ENTITY_NAME_H
 
-#include <iosfwd>
-#include <stdint.h>
-#include <string>
+#include <ifaddrs.h>
 
-#include "include/encoding.h"
-#include "include/buffer_fwd.h"
 #include "msg/msg_types.h"
 
 /* Represents a Ceph entity name.
@@ -30,17 +26,17 @@
  */
 struct EntityName
 {
-  EntityName();
-
-  void encode(bufferlist& bl) const {
-    ::encode(type, bl);
-    ::encode(id, bl);
+  void encode(ceph::buffer::list& bl) const {
+    using ceph::encode;
+    encode(type, bl);
+    encode(id, bl);
   }
-  void decode(bufferlist::iterator& bl) {
+  void decode(ceph::buffer::list::const_iterator& bl) {
+    using ceph::decode;
     uint32_t type_;
     std::string id_;
-    ::decode(type_, bl);
-    ::decode(id_, bl);
+    decode(type_, bl);
+    decode(id_, bl);
     set(type_, id_);
   }
 
@@ -58,6 +54,7 @@ struct EntityName
 
   uint32_t get_type() const { return type; }
   bool is_osd() const { return get_type() == CEPH_ENTITY_TYPE_OSD; }
+  bool is_mgr() const { return get_type() == CEPH_ENTITY_TYPE_MGR; }
   bool is_mds() const { return get_type() == CEPH_ENTITY_TYPE_MDS; }
   bool is_client() const { return get_type() == CEPH_ENTITY_TYPE_CLIENT; }
   bool is_mon() const { return get_type() == CEPH_ENTITY_TYPE_MON; }
@@ -67,6 +64,7 @@ struct EntityName
   bool has_default_id() const;
 
   static std::string get_valid_types_as_str();
+  static uint32_t str_to_ceph_entity_type(std::string_view);
 
   friend bool operator<(const EntityName& a, const EntityName& b);
   friend std::ostream& operator<<(std::ostream& out, const EntityName& n);
@@ -74,12 +72,16 @@ struct EntityName
   friend bool operator!=(const EntityName& a, const EntityName& b);
 
 private:
-  uint32_t type;
+  struct str_to_entity_type_t {
+    uint32_t type;
+    const char *str;
+  };
+  static const std::array<str_to_entity_type_t, 6> STR_TO_ENTITY_TYPE;
+
+  uint32_t type = 0;
   std::string id;
   std::string type_id;
 };
-
-uint32_t str_to_ceph_entity_type(const char * str);
 
 WRITE_CLASS_ENCODER(EntityName)
 

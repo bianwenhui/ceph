@@ -12,6 +12,7 @@
 #include "rgw_process.h"
 #include "rgw_loadgen.h"
 #include "rgw_client_io.h"
+#include "rgw_client_io_filters.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -23,12 +24,12 @@ void RGWFCGXProcess::run()
   int socket_backlog;
 
   conf->get_val("socket_path", "", &socket_path);
-  conf->get_val("socket_port", g_conf->rgw_port, &socket_port);
-  conf->get_val("socket_host", g_conf->rgw_host, &socket_host);
-  socket_backlog = g_conf->rgw_fcgi_socket_backlog;
+  conf->get_val("socket_port", g_conf()->rgw_port, &socket_port);
+  conf->get_val("socket_host", g_conf()->rgw_host, &socket_host);
+  socket_backlog = g_conf()->rgw_fcgi_socket_backlog;
 
   if (socket_path.empty() && socket_port.empty() && socket_host.empty()) {
-    socket_path = g_conf->rgw_socket_path;
+    socket_path = g_conf()->rgw_socket_path;
     if (socket_path.empty()) {
       dout(0) << "ERROR: no socket server point defined, cannot "
 	"start fcgi frontend" << dendl;
@@ -113,18 +114,25 @@ void RGWFCGXProcess::run()
 
 void RGWFCGXProcess::handle_request(RGWRequest* r)
 {
-  RGWFCGXRequest* req = static_cast<RGWFCGXRequest*>(r);
-  FCGX_Request* fcgx = req->fcgx;
-  RGWFCGX client_io(fcgx);
+  RGWFCGXRequest* const req = static_cast<RGWFCGXRequest*>(r);
+
+  RGWFCGX fcgxfe(req->fcgx);
+  auto real_client_io = rgw::io::add_reordering(
+                          rgw::io::add_buffering(cct,
+                            rgw::io::add_chunking(
+                              &fcgxfe)));
+  RGWRestfulIO client_io(cct, &real_client_io);
 
  
-  int ret = process_request(store, rest, req, &client_io, olog);
+  int ret = process_request(store, rest, req, uri_prefix,
+                            *auth_registry, &client_io, olog,
+                            null_yield, nullptr);
   if (ret < 0) {
     /* we don't really care about return code */
     dout(20) << "process_request() returned " << ret << dendl;
   }
 
-  FCGX_Finish_r(fcgx);
+  FCGX_Finish_r(req->fcgx);
 
   delete req;
 } /* RGWFCGXProcess::handle_request */

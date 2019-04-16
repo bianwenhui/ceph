@@ -5,6 +5,7 @@
 #define CEPH_RBD_MIRROR_BASE_REQUEST_H
 
 #include "common/RefCountedObj.h"
+#include "include/Context.h"
 
 namespace rbd {
 namespace mirror {
@@ -20,7 +21,7 @@ public:
   virtual void cancel() {}
 
 protected:
-  void finish(int r) {
+  virtual void finish(int r) {
     if (m_cct) {
       lsubdout(m_cct, rbd_mirror, 20) << m_name << "::finish: r=" << r << dendl;
     }

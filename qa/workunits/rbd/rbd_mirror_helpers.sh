@@ -8,13 +8,19 @@
 #
 # There are several env variables useful when troubleshooting a test failure:
 #
-#  RBD_MIRROR_NOCLEANUP - if not empty, don't run the cleanup (stop processes,
-#                         destroy the clusters and remove the temp directory)
-#                         on exit, so it is possible to check the test state
-#                         after failure.
-#  RBD_MIRROR_TEMDIR    - use this path when creating the temporary directory
-#                         (should not exist) instead of running mktemp(1).
-#
+#  RBD_MIRROR_NOCLEANUP  - if not empty, don't run the cleanup (stop processes,
+#                          destroy the clusters and remove the temp directory)
+#                          on exit, so it is possible to check the test state
+#                          after failure.
+#  RBD_MIRROR_TEMDIR     - use this path when creating the temporary directory
+#                          (should not exist) instead of running mktemp(1).
+#  RBD_MIRROR_ARGS       - use this to pass additional arguments to started
+#                          rbd-mirror daemons.
+#  RBD_MIRROR_VARGS      - use this to pass additional arguments to vstart.sh
+#                          when starting clusters.
+#  RBD_MIRROR_INSTANCES  - number of daemons to start per cluster
+#  RBD_MIRROR_CONFIG_KEY - if not empty, use config-key for remote cluster
+#                          secrets
 # The cleanup can be done as a separate step, running the script with
 # `cleanup ${RBD_MIRROR_TEMDIR}' arguments.
 #
@@ -60,11 +66,28 @@
 #     ../qa/workunits/rbd/rbd_mirror.sh cleanup
 #
 
+if type xmlstarlet > /dev/null 2>&1; then
+    XMLSTARLET=xmlstarlet
+elif type xml > /dev/null 2>&1; then
+    XMLSTARLET=xml
+else
+    echo "Missing xmlstarlet binary!"
+    exit 1
+fi
+
+RBD_MIRROR_INSTANCES=${RBD_MIRROR_INSTANCES:-2}
+
 CLUSTER1=cluster1
 CLUSTER2=cluster2
+PEER_CLUSTER_SUFFIX=
 POOL=mirror
 PARENT_POOL=mirror_parent
 TEMPDIR=
+CEPH_ID=${CEPH_ID:-mirror}
+MIRROR_USER_ID_PREFIX=${MIRROR_USER_ID_PREFIX:-${CEPH_ID}.}
+export CEPH_ARGS="--id ${CEPH_ID}"
+
+LAST_MIRROR_INSTANCE=$((${RBD_MIRROR_INSTANCES} - 1))
 
 CEPH_ROOT=$(readlink -f $(dirname $0)/../../../src)
 CEPH_BIN=.
@@ -95,32 +118,49 @@ fi
 # Functions
 #
 
+# Parse a value in format cluster[:instance] and set cluster and instance vars.
+set_cluster_instance()
+{
+    local val=$1
+    local cluster_var_name=$2
+    local instance_var_name=$3
+
+    cluster=${val%:*}
+    instance=${val##*:}
+
+    if [ "${instance}" =  "${val}" ]; then
+	# instance was not specified, use default
+	instance=0
+    fi
+
+    eval ${cluster_var_name}=${cluster}
+    eval ${instance_var_name}=${instance}
+}
+
 daemon_asok_file()
 {
     local local_cluster=$1
     local cluster=$2
+    local instance
 
-    if [ -n "${RBD_MIRROR_USE_RBD_MIRROR}" ]; then
-        echo $(ceph-conf --cluster $local_cluster --name "client.${CEPH_ID}" 'admin socket')
-    else
-        echo "${TEMPDIR}/rbd-mirror.${local_cluster}_daemon.${cluster}.asok"
-    fi
+    set_cluster_instance "${local_cluster}" local_cluster instance
+
+    echo $(ceph-conf --cluster $local_cluster --name "client.${MIRROR_USER_ID_PREFIX}${instance}" 'admin socket')
 }
 
 daemon_pid_file()
 {
     local cluster=$1
+    local instance
 
-    if [ -n "${RBD_MIRROR_USE_RBD_MIRROR}" ]; then
-        echo $(ceph-conf --cluster $cluster --name "client.${CEPH_ID}" 'pid file')
-    else
-        echo "${TEMPDIR}/rbd-mirror.${cluster}_daemon.pid"
-    fi
+    set_cluster_instance "${cluster}" cluster instance
+
+    echo $(ceph-conf --cluster $cluster --name "client.${MIRROR_USER_ID_PREFIX}${instance}" 'pid file')
 }
 
 testlog()
 {
-    echo $(date '+%F %T') $@ | tee -a "${TEMPDIR}/rbd-mirror.test.log"
+    echo $(date '+%F %T') $@ | tee -a "${TEMPDIR}/rbd-mirror.test.log" >&2
 }
 
 expect_failure()
@@ -145,88 +185,205 @@ expect_failure()
     return 0
 }
 
-setup()
+create_users()
 {
-    local c
-    trap cleanup INT TERM EXIT
+    local cluster=$1
 
+    CEPH_ARGS='' ceph --cluster "${cluster}" \
+        auth get-or-create client.${CEPH_ID} \
+        mon 'profile rbd' osd 'profile rbd' >> \
+        ${CEPH_ROOT}/run/${cluster}/keyring
+    for instance in `seq 0 ${LAST_MIRROR_INSTANCE}`; do
+        CEPH_ARGS='' ceph --cluster "${cluster}" \
+            auth get-or-create client.${MIRROR_USER_ID_PREFIX}${instance} \
+            mon 'profile rbd-mirror' osd 'profile rbd' >> \
+            ${CEPH_ROOT}/run/${cluster}/keyring
+    done
+}
+
+update_users()
+{
+    local cluster=$1
+
+    CEPH_ARGS='' ceph --cluster "${cluster}" \
+        auth caps client.${CEPH_ID} \
+        mon 'profile rbd' osd 'profile rbd'
+    for instance in `seq 0 ${LAST_MIRROR_INSTANCE}`; do
+        CEPH_ARGS='' ceph --cluster "${cluster}" \
+            auth caps client.${MIRROR_USER_ID_PREFIX}${instance} \
+            mon 'profile rbd-mirror' osd 'profile rbd'
+    done
+}
+
+setup_cluster()
+{
+    local cluster=$1
+
+    CEPH_ARGS='' ${CEPH_SRC}/mstart.sh ${cluster} -n ${RBD_MIRROR_VARGS}
+
+    cd ${CEPH_ROOT}
+    rm -f ${TEMPDIR}/${cluster}.conf
+    ln -s $(readlink -f run/${cluster}/ceph.conf) \
+       ${TEMPDIR}/${cluster}.conf
+
+    cd ${TEMPDIR}
+    create_users "${cluster}"
+
+    for instance in `seq 0 ${LAST_MIRROR_INSTANCE}`; do
+        cat<<EOF >> ${TEMPDIR}/${cluster}.conf
+[client.${MIRROR_USER_ID_PREFIX}${instance}]
+    admin socket = ${TEMPDIR}/rbd-mirror.\$cluster-\$name.asok
+    pid file = ${TEMPDIR}/rbd-mirror.\$cluster-\$name.pid
+    log file = ${TEMPDIR}/rbd-mirror.${cluster}_daemon.${instance}.log
+EOF
+    done
+}
+
+setup_pools()
+{
+    local cluster=$1
+    local remote_cluster=$2
+    local mon_map_file
+    local mon_addr
+    local admin_key_file
+    local uuid
+
+    CEPH_ARGS='' ceph --cluster ${cluster} osd pool create ${POOL} 64 64
+    CEPH_ARGS='' ceph --cluster ${cluster} osd pool create ${PARENT_POOL} 64 64
+
+    CEPH_ARGS='' rbd --cluster ${cluster} pool init ${POOL}
+    CEPH_ARGS='' rbd --cluster ${cluster} pool init ${PARENT_POOL}
+
+    rbd --cluster ${cluster} mirror pool enable ${POOL} pool
+    rbd --cluster ${cluster} mirror pool enable ${PARENT_POOL} image
+
+    if [ -z ${RBD_MIRROR_CONFIG_KEY} ]; then
+      rbd --cluster ${cluster} mirror pool peer add ${POOL} ${remote_cluster}
+      rbd --cluster ${cluster} mirror pool peer add ${PARENT_POOL} ${remote_cluster}
+    else
+      mon_map_file=${TEMPDIR}/${remote_cluster}.monmap
+      ceph --cluster ${remote_cluster} mon getmap > ${mon_map_file}
+      mon_addr=$(monmaptool --print ${mon_map_file} | grep -E 'mon\.' |
+        head -n 1 | sed -E 's/^[0-9]+: ([^ ]+).+$/\1/' | sed -E 's/\/[0-9]+//g')
+
+      admin_key_file=${TEMPDIR}/${remote_cluster}.client.${CEPH_ID}.key
+      CEPH_ARGS='' ceph --cluster ${remote_cluster} auth get-key client.${CEPH_ID} > ${admin_key_file}
+
+      rbd --cluster ${cluster} mirror pool peer add ${POOL} client.${CEPH_ID}@${remote_cluster}-DNE \
+          --remote-mon-host "${mon_addr}" --remote-key-file ${admin_key_file}
+
+      uuid=$(rbd --cluster ${cluster} mirror pool peer add ${PARENT_POOL} client.${CEPH_ID}@${remote_cluster}-DNE)
+      rbd --cluster ${cluster} mirror pool peer set ${PARENT_POOL} ${uuid} mon-host ${mon_addr}
+      rbd --cluster ${cluster} mirror pool peer set ${PARENT_POOL} ${uuid} key-file ${admin_key_file}
+
+      PEER_CLUSTER_SUFFIX=-DNE
+    fi
+}
+
+setup_tempdir()
+{
     if [ -n "${RBD_MIRROR_TEMDIR}" ]; then
+	test -d "${RBD_MIRROR_TEMDIR}" ||
 	mkdir "${RBD_MIRROR_TEMDIR}"
 	TEMPDIR="${RBD_MIRROR_TEMDIR}"
+	cd ${TEMPDIR}
     else
 	TEMPDIR=`mktemp -d`
     fi
+}
 
+setup()
+{
+    local c
+    trap 'cleanup $?' INT TERM EXIT
+
+    setup_tempdir
     if [ -z "${RBD_MIRROR_USE_EXISTING_CLUSTER}" ]; then
-        cd ${CEPH_ROOT}
-        ${CEPH_SRC}/mstart.sh ${CLUSTER1} -n
-        ${CEPH_SRC}/mstart.sh ${CLUSTER2} -n
-
-        ln -s $(readlink -f run/${CLUSTER1}/ceph.conf) \
-           ${TEMPDIR}/${CLUSTER1}.conf
-        ln -s $(readlink -f run/${CLUSTER2}/ceph.conf) \
-           ${TEMPDIR}/${CLUSTER2}.conf
-
-        cd ${TEMPDIR}
+	setup_cluster "${CLUSTER1}"
+	setup_cluster "${CLUSTER2}"
+    else
+	update_users "${CLUSTER1}"
+	update_users "${CLUSTER2}"
     fi
 
-    ceph --cluster ${CLUSTER1} osd pool create ${POOL} 64 64
-    ceph --cluster ${CLUSTER1} osd pool create ${PARENT_POOL} 64 64
-    ceph --cluster ${CLUSTER2} osd pool create ${PARENT_POOL} 64 64
-    ceph --cluster ${CLUSTER2} osd pool create ${POOL} 64 64
-
-    rbd --cluster ${CLUSTER1} mirror pool enable ${POOL} pool
-    rbd --cluster ${CLUSTER2} mirror pool enable ${POOL} pool
-    rbd --cluster ${CLUSTER1} mirror pool enable ${PARENT_POOL} image
-    rbd --cluster ${CLUSTER2} mirror pool enable ${PARENT_POOL} image
-
-    rbd --cluster ${CLUSTER1} mirror pool peer add ${POOL} ${CLUSTER2}
-    rbd --cluster ${CLUSTER2} mirror pool peer add ${POOL} ${CLUSTER1}
-    rbd --cluster ${CLUSTER1} mirror pool peer add ${PARENT_POOL} ${CLUSTER2}
-    rbd --cluster ${CLUSTER2} mirror pool peer add ${PARENT_POOL} ${CLUSTER1}
+    setup_pools "${CLUSTER1}" "${CLUSTER2}"
+    setup_pools "${CLUSTER2}" "${CLUSTER1}"
 }
 
 cleanup()
 {
-    test  -n "${RBD_MIRROR_NOCLEANUP}" && return
+    local error_code=$1
 
     set +e
 
-    stop_mirror "${CLUSTER1}"
-    stop_mirror "${CLUSTER2}"
-
-    if [ -z "${RBD_MIRROR_USE_EXISTING_CLUSTER}" ]; then
-        cd ${CEPH_ROOT}
-        ${CEPH_SRC}/mstop.sh ${CLUSTER1}
-        ${CEPH_SRC}/mstop.sh ${CLUSTER2}
-    else
-        ceph --cluster ${CLUSTER1} osd pool rm ${POOL} ${POOL} --yes-i-really-really-mean-it
-        ceph --cluster ${CLUSTER2} osd pool rm ${POOL} ${POOL} --yes-i-really-really-mean-it
-        ceph --cluster ${CLUSTER1} osd pool rm ${PARENT_POOL} ${PARENT_POOL} --yes-i-really-really-mean-it
-        ceph --cluster ${CLUSTER2} osd pool rm ${PARENT_POOL} ${PARENT_POOL} --yes-i-really-really-mean-it
+    if [ "${error_code}" -ne 0 ]; then
+        status
     fi
-    rm -Rf ${TEMPDIR}
+
+    if [ -z "${RBD_MIRROR_NOCLEANUP}" ]; then
+        local cluster instance
+
+        CEPH_ARGS='' ceph --cluster ${CLUSTER1} osd pool rm ${POOL} ${POOL} --yes-i-really-really-mean-it
+        CEPH_ARGS='' ceph --cluster ${CLUSTER2} osd pool rm ${POOL} ${POOL} --yes-i-really-really-mean-it
+        CEPH_ARGS='' ceph --cluster ${CLUSTER1} osd pool rm ${PARENT_POOL} ${PARENT_POOL} --yes-i-really-really-mean-it
+        CEPH_ARGS='' ceph --cluster ${CLUSTER2} osd pool rm ${PARENT_POOL} ${PARENT_POOL} --yes-i-really-really-mean-it
+
+        for cluster in "${CLUSTER1}" "${CLUSTER2}"; do
+	    stop_mirrors "${cluster}"
+        done
+
+        if [ -z "${RBD_MIRROR_USE_EXISTING_CLUSTER}" ]; then
+            cd ${CEPH_ROOT}
+            CEPH_ARGS='' ${CEPH_SRC}/mstop.sh ${CLUSTER1}
+            CEPH_ARGS='' ${CEPH_SRC}/mstop.sh ${CLUSTER2}
+        fi
+        test "${RBD_MIRROR_TEMDIR}" = "${TEMPDIR}" || rm -Rf ${TEMPDIR}
+    fi
+
+    if [ "${error_code}" -eq 0 ]; then
+        echo "OK"
+    else
+        echo "FAIL"
+    fi
+
+    exit ${error_code}
 }
 
 start_mirror()
 {
     local cluster=$1
+    local instance
+
+    set_cluster_instance "${cluster}" cluster instance
 
     test -n "${RBD_MIRROR_USE_RBD_MIRROR}" && return
 
     rbd-mirror \
 	--cluster ${cluster} \
-	--pid-file=$(daemon_pid_file "${cluster}") \
-	--log-file=${TEMPDIR}/rbd-mirror.${cluster}_daemon.\$cluster.\$pid.log \
-	--admin-socket=${TEMPDIR}/rbd-mirror.${cluster}_daemon.\$cluster.asok \
+        --id ${MIRROR_USER_ID_PREFIX}${instance} \
+	--rbd-mirror-delete-retry-interval=5 \
+	--rbd-mirror-image-state-check-interval=5 \
+	--rbd-mirror-journal-poll-age=1 \
+	--rbd-mirror-pool-replayers-refresh-interval=5 \
 	--debug-rbd=30 --debug-journaler=30 \
 	--debug-rbd_mirror=30 \
-	--daemonize=true
+	--daemonize=true \
+	${RBD_MIRROR_ARGS}
+}
+
+start_mirrors()
+{
+    local cluster=$1
+
+    for instance in `seq 0 ${LAST_MIRROR_INSTANCE}`; do
+        start_mirror "${cluster}:${instance}"
+    done
 }
 
 stop_mirror()
 {
     local cluster=$1
+    local sig=$2
 
     test -n "${RBD_MIRROR_USE_RBD_MIRROR}" && return
 
@@ -234,7 +391,7 @@ stop_mirror()
     pid=$(cat $(daemon_pid_file "${cluster}") 2>/dev/null) || :
     if [ -n "${pid}" ]
     then
-	kill ${pid}
+	kill ${sig} ${pid}
 	for s in 1 2 4 8 16 32; do
 	    sleep $s
 	    ps auxww | awk -v pid=${pid} '$2 == pid {print; exit 1}' && break
@@ -246,14 +403,56 @@ stop_mirror()
     rm -f $(daemon_pid_file "${cluster}")
 }
 
+stop_mirrors()
+{
+    local cluster=$1
+    local sig=$2
+
+    for instance in `seq 0 ${LAST_MIRROR_INSTANCE}`; do
+        stop_mirror "${cluster}:${instance}" "${sig}"
+    done
+}
+
 admin_daemon()
 {
     local cluster=$1 ; shift
+    local instance
 
-    local asok_file=$(daemon_asok_file "${cluster}" "${cluster}")
+    set_cluster_instance "${cluster}" cluster instance
+
+    local asok_file=$(daemon_asok_file "${cluster}:${instance}" "${cluster}")
     test -S "${asok_file}"
 
     ceph --admin-daemon ${asok_file} $@
+}
+
+admin_daemons()
+{
+    local cluster_instance=$1 ; shift
+    local cluster="${cluster_instance%:*}"
+    local instance="${cluster_instance##*:}"
+    local loop_instance
+
+    for s in 0 1 2 4 8 8 8 8 8 8 8 8 16 16; do
+	sleep ${s}
+	if [ "${instance}" != "${cluster_instance}" ]; then
+	    admin_daemon "${cluster}:${instance}" $@ && return 0
+	else
+	    for loop_instance in `seq 0 ${LAST_MIRROR_INSTANCE}`; do
+		admin_daemon "${cluster}:${loop_instance}" $@ && return 0
+	    done
+	fi
+    done
+    return 1
+}
+
+all_admin_daemons()
+{
+    local cluster=$1 ; shift
+
+    for instance in `seq 0 ${LAST_MIRROR_INSTANCE}`; do
+	admin_daemon "${cluster}:${instance}" $@
+    done
 }
 
 status()
@@ -264,12 +463,14 @@ status()
     do
 	echo "${cluster} status"
 	ceph --cluster ${cluster} -s
+	ceph --cluster ${cluster} service dump
+	ceph --cluster ${cluster} service status
 	echo
 
 	for image_pool in ${POOL} ${PARENT_POOL}
 	do
 	    echo "${cluster} ${image_pool} images"
-	    rbd --cluster ${cluster} -p ${image_pool} ls
+	    rbd --cluster ${cluster} -p ${image_pool} ls -l
 	    echo
 
 	    echo "${cluster} ${image_pool} mirror pool status"
@@ -292,47 +493,49 @@ status()
 
     for cluster in "${CLUSTER1}" "${CLUSTER2}"
     do
-	local pid_file=$(daemon_pid_file ${cluster} )
-	if [ ! -e ${pid_file} ]
-	then
-	    echo "${cluster} rbd-mirror not running or unknown" \
-		 "(${pid_file} not exist)"
-	    continue
-	fi
+	for instance in `seq 0 ${LAST_MIRROR_INSTANCE}`; do
+	    local pid_file=$(daemon_pid_file ${cluster}:${instance})
+	    if [ ! -e ${pid_file} ]
+	    then
+		echo "${cluster} rbd-mirror not running or unknown" \
+		     "(${pid_file} not exist)"
+		continue
+	    fi
 
-	local pid
-	pid=$(cat ${pid_file} 2>/dev/null) || :
-	if [ -z "${pid}" ]
-	then
-	    echo "${cluster} rbd-mirror not running or unknown" \
-		 "(can't find pid using ${pid_file})"
-	    ret=1
-	    continue
-	fi
+	    local pid
+	    pid=$(cat ${pid_file} 2>/dev/null) || :
+	    if [ -z "${pid}" ]
+	    then
+		echo "${cluster} rbd-mirror not running or unknown" \
+		     "(can't find pid using ${pid_file})"
+		ret=1
+		continue
+	    fi
 
-	echo "${daemon} rbd-mirror process in ps output:"
-	if ps auxww |
+	    echo "${daemon} rbd-mirror process in ps output:"
+	    if ps auxww |
 		awk -v pid=${pid} 'NR == 1 {print} $2 == pid {print; exit 1}'
-	then
+	    then
+		echo
+		echo "${cluster} rbd-mirror not running" \
+		     "(can't find pid $pid in ps output)"
+		ret=1
+		continue
+	    fi
 	    echo
-	    echo "${cluster} rbd-mirror not running" \
-		 "(can't find pid $pid in ps output)"
-	    ret=1
-	    continue
-	fi
-	echo
 
-	local asok_file=$(daemon_asok_file ${cluster} ${cluster})
-	if [ ! -S "${asok_file}" ]
-	then
-	    echo "${cluster} rbd-mirror asok is unknown (${asok_file} not exits)"
-	    ret=1
-	    continue
-	fi
+	    local asok_file=$(daemon_asok_file ${cluster}:${instance} ${cluster})
+	    if [ ! -S "${asok_file}" ]
+	    then
+		echo "${cluster} rbd-mirror asok is unknown (${asok_file} not exits)"
+		ret=1
+		continue
+	    fi
 
-	echo "${cluster} rbd-mirror status"
-	ceph --admin-daemon ${asok_file} rbd mirror status
-	echo
+	    echo "${cluster} rbd-mirror status"
+	    ceph --admin-daemon ${asok_file} rbd mirror status
+	    echo
+	done
     done
 
     return ${ret}
@@ -350,7 +553,7 @@ flush()
        cmd="${cmd} ${pool}/${image}"
     fi
 
-    admin_daemon "${cluster}" ${cmd}
+    admin_daemons "${cluster}" ${cmd}
 }
 
 test_image_replay_state()
@@ -359,14 +562,11 @@ test_image_replay_state()
     local pool=$2
     local image=$3
     local test_state=$4
+    local status_result
     local current_state=stopped
 
-    admin_daemon "${cluster}" help |
-	fgrep "\"rbd mirror status ${pool}/${image}\"" &&
-    admin_daemon "${cluster}" rbd mirror status ${pool}/${image} |
-	grep -i 'state.*Replaying' &&
-    current_state=started
-
+    status_result=$(admin_daemons "${cluster}" rbd mirror status ${pool}/${image} | grep -i 'state') || return 1
+    echo "${status_result}" | grep -i 'Replaying' && current_state=started
     test "${test_state}" = "${current_state}"
 }
 
@@ -417,7 +617,7 @@ get_position()
     local status_log=${TEMPDIR}/${CLUSTER2}-${pool}-${image}.status
     rbd --cluster ${cluster} -p ${pool} journal status --image ${image} |
 	tee ${status_log} >&2
-    sed -nEe 's/^.*\[id='"${id_regexp}"',.*positions=\[\[([^]]*)\],.*$/\1/p' \
+    sed -nEe 's/^.*\[id='"${id_regexp}"',.*positions=\[\[([^]]*)\],.*state=connected.*$/\1/p' \
 	${status_log}
 }
 
@@ -476,24 +676,91 @@ test_status_in_pool_dir()
     local cluster=$1
     local pool=$2
     local image=$3
-    local state_pattern=$4
-    local description_pattern=$5
+    local state_pattern="$4"
+    local description_pattern="$5"
+    local service_pattern="$6"
 
     local status_log=${TEMPDIR}/${cluster}-${image}.mirror_status
     rbd --cluster ${cluster} -p ${pool} mirror image status ${image} |
-	tee ${status_log}
-    grep "state: .*${state_pattern}" ${status_log}
-    grep "description: .*${description_pattern}" ${status_log}
+	tee ${status_log} >&2
+    grep "state: .*${state_pattern}" ${status_log} || return 1
+    grep "description: .*${description_pattern}" ${status_log} || return 1
+
+    if [ -n "${service_pattern}" ]; then
+        grep "service: *${service_pattern}" ${status_log} || return 1
+    elif echo ${state_pattern} | grep '^up+'; then
+        grep "service: *${MIRROR_USER_ID_PREFIX}.* on " ${status_log} || return 1
+    else
+        grep "service: " ${status_log} && return 1
+    fi
+
+    return 0
 }
 
-create_image()
+wait_for_status_in_pool_dir()
 {
     local cluster=$1
     local pool=$2
     local image=$3
+    local state_pattern="$4"
+    local description_pattern="$5"
+    local service_pattern="$6"
 
-    rbd --cluster ${cluster} -p ${pool} create --size 128 \
-	--image-feature layering,exclusive-lock,journaling ${image}
+    for s in 1 2 4 8 8 8 8 8 8 8 8 16 16; do
+	sleep ${s}
+	test_status_in_pool_dir ${cluster} ${pool} ${image} "${state_pattern}" \
+                                "${description_pattern}" "${service_pattern}" &&
+            return 0
+    done
+    return 1
+}
+
+create_image()
+{
+    local cluster=$1 ; shift
+    local pool=$1 ; shift
+    local image=$1 ; shift
+    local size=128
+
+    if [ -n "$1" ]; then
+	size=$1
+	shift
+    fi
+
+    rbd --cluster ${cluster} -p ${pool} create --size ${size} \
+	--image-feature layering,exclusive-lock,journaling $@ ${image}
+}
+
+set_image_meta()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local key=$4
+    local val=$5
+
+    rbd --cluster ${cluster} -p ${pool} image-meta set ${image} $key $val
+}
+
+compare_image_meta()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local key=$4
+    local value=$5
+
+    test `rbd --cluster ${cluster} -p ${pool} image-meta get ${image} ${key}` = "${value}"
+}
+
+rename_image()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local new_name=$4
+
+    rbd --cluster=${cluster} -p ${pool} rename ${image} ${new_name}
 }
 
 remove_image()
@@ -502,6 +769,7 @@ remove_image()
     local pool=$2
     local image=$3
 
+    rbd --cluster=${cluster} -p ${pool} snap purge ${image}
     rbd --cluster=${cluster} -p ${pool} rm ${image}
 }
 
@@ -511,11 +779,27 @@ remove_image_retry()
     local pool=$2
     local image=$3
 
-    for s in 1 2 4 8 16 32; do
-        remove_image ${cluster} ${pool} ${image} && return 0
+    for s in 0 1 2 4 8 16 32; do
         sleep ${s}
+        remove_image ${cluster} ${pool} ${image} && return 0
     done
     return 1
+}
+
+trash_move() {
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster=${cluster} -p ${pool} trash move ${image}
+}
+
+trash_restore() {
+    local cluster=$1
+    local pool=$2
+    local image_id=$3
+
+    rbd --cluster=${cluster} -p ${pool} trash restore ${image_id}
 }
 
 clone_image()
@@ -529,6 +813,16 @@ clone_image()
 
     rbd --cluster ${cluster} clone ${parent_pool}/${parent_image}@${parent_snap} \
 	${clone_pool}/${clone_image} --image-feature layering,exclusive-lock,journaling
+}
+
+disconnect_image()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster ${cluster} -p ${pool} journal client disconnect \
+	--image ${image}
 }
 
 create_snapshot()
@@ -613,9 +907,12 @@ write_image()
     local pool=$2
     local image=$3
     local count=$4
+    local size=$5
 
-    rbd --cluster ${cluster} -p ${pool} bench-write ${image} \
-	--io-size 4096 --io-threads 1 --io-total $((4096 * count)) \
+    test -n "${size}" || size=4096
+
+    rbd --cluster ${cluster} -p ${pool} bench ${image} --io-type write \
+	--io-size ${size} --io-threads 1 --io-total $((size * count)) \
 	--io-pattern rand
 }
 
@@ -624,7 +921,7 @@ stress_write_image()
     local cluster=$1
     local pool=$2
     local image=$3
-    local duration=$(awk 'BEGIN {srand(); print int(35 * rand()) + 15}')
+    local duration=$(awk 'BEGIN {srand(); print int(10 * rand()) + 5}')
 
     timeout ${duration}s ceph_test_rbd_mirror_random_write \
 	--cluster ${cluster} ${pool} ${image} \
@@ -641,9 +938,29 @@ compare_images()
     local loc_export=${TEMPDIR}/${CLUSTER1}-${pool}-${image}.export
 
     rm -f ${rmt_export} ${loc_export}
-    rbd --cluster ${CLUSTER2} -p ${pool} export ${image} ${rmt_export}
-    rbd --cluster ${CLUSTER1} -p ${pool} export ${image} ${loc_export}
-    cmp ${rmt_export} ${loc_export}
+    rbd --cluster ${CLUSTER2} -p ${pool} export ${image} - | xxd > ${rmt_export}
+    rbd --cluster ${CLUSTER1} -p ${pool} export ${image} - | xxd > ${loc_export}
+    sdiff -s ${rmt_export} ${loc_export} | head -n 64
+    rm -f ${rmt_export} ${loc_export}
+}
+
+compare_image_snapshots()
+{
+    local pool=$1
+    local image=$2
+
+    local rmt_export=${TEMPDIR}/${CLUSTER2}-${pool}-${image}.export
+    local loc_export=${TEMPDIR}/${CLUSTER1}-${pool}-${image}.export
+
+    for snap_name in $(rbd --cluster ${CLUSTER1} -p ${pool} --format xml \
+                           snap list ${image} | \
+                           $XMLSTARLET sel -t -v "//snapshot/name" | \
+                           grep -E -v "^\.rbd-mirror\."); do
+        rm -f ${rmt_export} ${loc_export}
+        rbd --cluster ${CLUSTER2} -p ${pool} export ${image}@${snap_name} - | xxd > ${rmt_export}
+        rbd --cluster ${CLUSTER1} -p ${pool} export ${image}@${snap_name} - | xxd > ${loc_export}
+        sdiff -s ${rmt_export} ${loc_export} | head -n 64
+    done
     rm -f ${rmt_export} ${loc_export}
 }
 
@@ -661,8 +978,9 @@ promote_image()
     local cluster=$1
     local pool=$2
     local image=$3
+    local force=$4
 
-    rbd --cluster=${cluster} mirror image promote ${pool}/${image}
+    rbd --cluster=${cluster} mirror image promote ${pool}/${image} ${force}
 }
 
 set_pool_mirror_mode()
@@ -698,9 +1016,13 @@ test_image_present()
     local pool=$2
     local image=$3
     local test_state=$4
+    local image_id=$5
     local current_state=deleted
+    local current_image_id
 
-    rbd --cluster=${cluster} -p ${pool} ls | grep "^${image}$" &&
+    current_image_id=$(get_image_id ${cluster} ${pool} ${image})
+    test -n "${current_image_id}" &&
+    test -z "${image_id}" -o "${image_id}" = "${current_image_id}" &&
     current_state=present
 
     test "${test_state}" = "${current_state}"
@@ -712,14 +1034,30 @@ wait_for_image_present()
     local pool=$2
     local image=$3
     local state=$4
+    local image_id=$5
     local s
+
+    test -n "${image_id}" ||
+    image_id=$(get_image_id ${cluster} ${pool} ${image})
 
     # TODO: add a way to force rbd-mirror to update replayers
     for s in 0.1 1 2 4 8 8 8 8 8 8 8 8 16 16 32 32; do
 	sleep ${s}
-	test_image_present "${cluster}" "${pool}" "${image}" "${state}" && return 0
+	test_image_present \
+            "${cluster}" "${pool}" "${image}" "${state}" "${image_id}" &&
+        return 0
     done
     return 1
+}
+
+get_image_id()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster=${cluster} -p ${pool} info ${image} |
+	sed -ne 's/^.*block_name_prefix: rbd_data\.//p'
 }
 
 request_resync_image()
@@ -727,8 +1065,22 @@ request_resync_image()
     local cluster=$1
     local pool=$2
     local image=$3
+    local image_id_var_name=$4
+
+    eval "${image_id_var_name}='$(get_image_id ${cluster} ${pool} ${image})'"
+    eval 'test -n "$'${image_id_var_name}'"'
 
     rbd --cluster=${cluster} -p ${pool} mirror image resync ${image}
+}
+
+get_image_data_pool()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster ${cluster} -p ${pool} info ${image} |
+        awk '$1 == "data_pool:" {print $2}'
 }
 
 #
@@ -748,7 +1100,3 @@ then
     $@
     exit $?
 fi
-
-set -xe
-
-setup

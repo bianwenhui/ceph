@@ -19,10 +19,15 @@
 test -d dev/osd0/. && test -e dev/sudo && SUDO="sudo"
 
 if [ -e CMakeCache.txt ]; then
-  [ -z "$CEPH_BIN" ] && CEPH_BIN=src
-else
   [ -z "$CEPH_BIN" ] && CEPH_BIN=bin
 fi
+
+if [ -n "$VSTART_DEST" ]; then
+  CEPH_CONF_PATH=$VSTART_DEST
+else
+  CEPH_CONF_PATH="$PWD"
+fi
+conf_fn="$CEPH_CONF_PATH/ceph.conf"
 
 MYUID=$(id -u)
 MYNAME=$(id -nu)
@@ -39,6 +44,7 @@ stop_all=1
 stop_mon=0
 stop_mds=0
 stop_osd=0
+stop_mgr=0
 stop_rgw=0
 
 while [ $# -ge 1 ]; do
@@ -48,6 +54,10 @@ while [ $# -ge 1 ]; do
             ;;
         mon | ceph-mon )
             stop_mon=1
+            stop_all=0
+            ;;
+        mgr | ceph-mgr )
+            stop_mgr=1
             stop_all=0
             ;;
         mds | ceph-mds )
@@ -70,8 +80,8 @@ while [ $# -ge 1 ]; do
 done
 
 if [ $stop_all -eq 1 ]; then
-    if "${CEPH_BIN}"/rbd showmapped >/dev/null 2>&1; then
-        "${CEPH_BIN}"/rbd showmapped | tail -n +2 |
+    if "${CEPH_BIN}"/rbd device list -c $conf_fn >/dev/null 2>&1; then
+        "${CEPH_BIN}"/rbd device list -c $conf_fn | tail -n +2 |
         while read DEV; do
             # While it is currently possible to create an rbd image with
             # whitespace chars in its name, krbd will refuse mapping such
@@ -79,15 +89,15 @@ if [ $stop_all -eq 1 ]; then
             # same goes for whitespace chars in names of the pools that
             # contain rbd images).
             DEV="$(echo "${DEV}" | tr -s '[:space:]' | awk '{ print $5 }')"
-            sudo "${CEPH_BIN}"/rbd unmap "${DEV}"
+            sudo "${CEPH_BIN}"/rbd device unmap "${DEV}" -c $conf_fn
         done
 
-        if [ -n "$("${CEPH_BIN}"/rbd showmapped)" ]; then
+        if [ -n "$("${CEPH_BIN}"/rbd device list -c $conf_fn)" ]; then
             echo "WARNING: Some rbd images are still mapped!" >&2
         fi
     fi
 
-    for p in ceph-mon ceph-mds ceph-osd radosgw lt-radosgw apache2 ; do
+    for p in ceph-mon ceph-mds ceph-osd ceph-mgr radosgw lt-radosgw apache2 ; do
         for try in 0 1 1 1 1 ; do
             if ! pkill -u $MYUID $p ; then
                 break
@@ -99,9 +109,12 @@ if [ $stop_all -eq 1 ]; then
     pkill -u $MYUID -f valgrind.bin.\*ceph-mon
     $SUDO pkill -u $MYUID -f valgrind.bin.\*ceph-osd
     pkill -u $MYUID -f valgrind.bin.\*ceph-mds
+    asok_dir=`dirname $("${CEPH_BIN}"/ceph-conf -c ${conf_fn} --show-config-value admin_socket)`
+    rm -rf "${asok_dir}"
 else
     [ $stop_mon -eq 1 ] && do_killall ceph-mon
     [ $stop_mds -eq 1 ] && do_killall ceph-mds
     [ $stop_osd -eq 1 ] && do_killall ceph-osd
+    [ $stop_mgr -eq 1 ] && do_killall ceph-mgr
     [ $stop_rgw -eq 1 ] && do_killall radosgw lt-radosgw apache2
 fi

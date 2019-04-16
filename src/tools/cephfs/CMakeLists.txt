@@ -25,9 +25,10 @@ set(cephfs_data_scan_srcs
   cephfs-data-scan.cc
   DataScan.cc
   RoleSelector.cc
+  PgFiles.cc
   MDSUtility.cc)
 add_executable(cephfs-data-scan ${cephfs_data_scan_srcs})
-target_link_libraries(cephfs-data-scan librados mds osdc global
+target_link_libraries(cephfs-data-scan librados cephfs mds osdc global
   cls_cephfs_client
   ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS})
 
@@ -36,3 +37,13 @@ install(TARGETS
   cephfs-table-tool
   cephfs-data-scan
   DESTINATION bin)
+
+option(WITH_CEPHFS_SHELL "install cephfs-shell" OFF)
+if(WITH_CEPHFS_SHELL)
+  if(NOT WITH_PYTHON3)
+    message(SEND_ERROR "Please enable WITH_PYTHON3 for cephfs-shell")
+  endif()
+  set(PYTHON_VERSION 3)
+  include(Distutils)
+  distutils_install_module(cephfs-shell)
+endif()

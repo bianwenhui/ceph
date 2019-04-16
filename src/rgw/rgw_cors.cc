@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -11,12 +12,13 @@
  * Foundation. See file COPYING.
  *
  */
+
 #include <string.h>
 
 #include <iostream>
 #include <map>
 
-#include <boost/algorithm/string.hpp> 
+#include <boost/algorithm/string.hpp>
 
 #include "include/types.h"
 #include "common/debug.h"
@@ -25,8 +27,8 @@
 
 #include "rgw_cors.h"
 
+#define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
-using namespace std;
 
 void RGWCORSRule::dump_origins() {
   unsigned num_origins = allowed_origins.size();
@@ -104,7 +106,8 @@ static bool is_string_in_set(set<string>& s, string h) {
         string sl = ssplit.front();
         dout(10) << "Finding " << sl << ", in " << h 
           << ", at offset not less than " << flen << dendl;
-        if (h.compare((h.size() - sl.size()), sl.size(), sl) != 0)
+        if (h.size() < sl.size() ||
+	    h.compare((h.size() - sl.size()), sl.size(), sl) != 0)
           continue;
         ssplit.pop_front();
       }

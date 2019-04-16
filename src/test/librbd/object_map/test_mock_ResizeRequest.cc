@@ -1,4 +1,4 @@
-// -*- mode:C; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #include "test/librbd/test_mock_fixture.h"
@@ -7,6 +7,7 @@
 #include "common/bit_vector.hpp"
 #include "librbd/internal.h"
 #include "librbd/ObjectMap.h"
+#include "librbd/api/Image.h"
 #include "librbd/object_map/ResizeRequest.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -22,7 +23,7 @@ using ::testing::StrEq;
 class TestMockObjectMapResizeRequest : public TestMockFixture {
 public:
   void expect_resize(librbd::ImageCtx *ictx, uint64_t snap_id, int r) {
-    std::string oid(ObjectMap::object_map_name(ictx->id, snap_id));
+    std::string oid(ObjectMap<>::object_map_name(ictx->id, snap_id));
     if (snap_id == CEPH_NOSNAP) {
       EXPECT_CALL(get_mock_io_ctx(ictx->md_ctx),
                   exec(oid, _, StrEq("lock"), StrEq("assert_locked"), _, _, _))
@@ -41,8 +42,6 @@ public:
   }
 
   void expect_invalidate(librbd::ImageCtx *ictx) {
-    EXPECT_CALL(get_mock_io_ctx(ictx->md_ctx),
-                exec(ictx->header_oid, _, StrEq("lock"), StrEq("assert_locked"), _, _, _)).Times(0);
     EXPECT_CALL(get_mock_io_ctx(ictx->md_ctx),
                 exec(ictx->header_oid, _, StrEq("rbd"), StrEq("set_flags"), _, _, _))
                   .WillOnce(DoDefault());
@@ -100,7 +99,9 @@ TEST_F(TestMockObjectMapResizeRequest, UpdateSnapOnDisk) {
   librbd::ImageCtx *ictx;
   ASSERT_EQ(0, open_image(m_image_name, &ictx));
   ASSERT_EQ(0, snap_create(*ictx, "snap1"));
-  ASSERT_EQ(0, librbd::snap_set(ictx, "snap1"));
+  ASSERT_EQ(0, librbd::api::Image<>::snap_set(ictx,
+				              cls::rbd::UserSnapshotNamespace(),
+				              "snap1"));
 
   uint64_t snap_id = ictx->snap_id;
   expect_resize(ictx, snap_id, 0);

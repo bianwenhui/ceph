@@ -11,25 +11,13 @@
  * Foundation.  See file COPYING.
  *
  */
+#include <stdarg.h>
 
 #include "auth/Auth.h"
-#include "common/ConfUtils.h"
 #include "common/ceph_argparse.h"
-#include "common/common_init.h"
 #include "common/config.h"
-#include "common/strtol.h"
 #include "common/version.h"
-#include "include/intarith.h"
 #include "include/str_list.h"
-#include "msg/msg_types.h"
-
-#include <errno.h>
-#include <stdarg.h>
-#include <stdlib.h>
-#include <string>
-#include <string.h>
-#include <sstream>
-#include <vector>
 
 /*
  * Ceph argument parsing library
@@ -95,13 +83,20 @@ bool split_dashdash(const std::vector<const char*>& args,
   return dashdash;
 }
 
+static std::mutex g_str_vec_lock;
+static vector<string> g_str_vec;
+
+void clear_g_str_vec()
+{
+  g_str_vec_lock.lock();
+  g_str_vec.clear();
+  g_str_vec_lock.unlock();
+}
+
 void env_to_vec(std::vector<const char*>& args, const char *name)
 {
   if (!name)
     name = "CEPH_ARGS";
-  char *p = getenv(name);
-  if (!p)
-    return;
 
   bool dashdash = false;
   std::vector<const char*> options;
@@ -111,13 +106,25 @@ void env_to_vec(std::vector<const char*>& args, const char *name)
 
   std::vector<const char*> env_options;
   std::vector<const char*> env_arguments;
-  static vector<string> str_vec;
   std::vector<const char*> env;
-  str_vec.clear();
-  get_str_vec(p, " ", str_vec);
-  for (vector<string>::iterator i = str_vec.begin();
-       i != str_vec.end();
-       ++i)
+
+  /*
+   * We can only populate str_vec once. Other threads could hold pointers into
+   * it, so clearing it out and replacing it is not currently safe.
+   */
+  g_str_vec_lock.lock();
+  if (g_str_vec.empty()) {
+    char *p = getenv(name);
+    if (!p) {
+      g_str_vec_lock.unlock();
+      return;
+    }
+    get_str_vec(p, " ", g_str_vec);
+  }
+  g_str_vec_lock.unlock();
+
+  vector<string>::iterator i;
+  for (i = g_str_vec.begin(); i != g_str_vec.end(); ++i)
     env.push_back(i->c_str());
   if (split_dashdash(env, env_options, env_arguments))
     dashdash = true;
@@ -134,8 +141,7 @@ void env_to_vec(std::vector<const char*>& args, const char *name)
 void argv_to_vec(int argc, const char **argv,
                  std::vector<const char*>& args)
 {
-  for (int i=1; i<argc; i++)
-    args.push_back(argv[i]);
+  args.insert(args.end(), argv + 1, argv + argc);
 }
 
 void vec_to_argv(const char *argv0, std::vector<const char*>& args,
@@ -195,21 +201,40 @@ void ceph_arg_value_type(const char * nextargstr, bool *bool_option, bool *bool_
   return;
 }
 
-bool parse_ip_port_vec(const char *s, vector<entity_addr_t>& vec)
+
+bool parse_ip_port_vec(const char *s, vector<entity_addrvec_t>& vec, int type)
 {
-  const char *p = s;
-  const char *end = p + strlen(p);
-  while (p < end) {
-    entity_addr_t a;
-    //cout << " parse at '" << p << "'" << std::endl;
-    if (!a.parse(p, &p)) {
-      //dout(0) << " failed to parse address '" << p << "'" << dendl;
-      return false;
+  // first split by [ ;], which are not valid for an addrvec
+  list<string> items;
+  get_str_list(s, " ;", items);
+
+  for (auto& i : items) {
+    const char *s = i.c_str();
+    while (*s) {
+      const char *end;
+
+      // try parsing as an addr
+      entity_addr_t a;
+      if (a.parse(s, &end, type)) {
+	vec.push_back(entity_addrvec_t(a));
+	s = end;
+	if (*s == ',') {
+	  ++s;
+	}
+	continue;
+      }
+
+      // ok, try parsing as an addrvec
+      entity_addrvec_t av;
+      if (!av.parse(s, &end)) {
+	return false;
+      }
+      vec.push_back(av);
+      s = end;
+      if (*s == ',') {
+	++s;
+      }
     }
-    //cout << " got " << a << ", rest is '" << p << "'" << std::endl;
-    vec.push_back(a);
-    while (*p == ',' || *p == ' ' || *p == ';')
-      p++;
   }
   return true;
 }
@@ -457,7 +482,7 @@ bool ceph_argparse_witharg(std::vector<const char*> &args,
 }
 
 CephInitParameters ceph_argparse_early_args
-	  (std::vector<const char*>& args, uint32_t module_type, int flags,
+	  (std::vector<const char*>& args, uint32_t module_type,
 	   std::string *cluster, std::string *conf_file_list)
 {
   CephInitParameters iparams(module_type);
@@ -516,34 +541,49 @@ CephInitParameters ceph_argparse_early_args
 
 static void generic_usage(bool is_server)
 {
-  cout << "\
-  --conf/-c FILE    read configuration from the given configuration file\n\
-  --id/-i ID        set ID portion of my name\n\
-  --name/-n TYPE.ID set name\n\
-  --cluster NAME    set cluster name (default: ceph)\n\
-  --setuser USER    set uid to user or uid (and gid to user's gid)\n\
-  --setgroup GROUP  set gid to group or gid\n\
-  --version         show version and quit\n\
-" << std::endl;
+  cout <<
+    "  --conf/-c FILE    read configuration from the given configuration file" << std::endl <<
+    (is_server ?
+    "  --id/-i ID        set ID portion of my name" :
+    "  --id ID           set ID portion of my name") << std::endl <<
+    "  --name/-n TYPE.ID set name" << std::endl <<
+    "  --cluster NAME    set cluster name (default: ceph)" << std::endl <<
+    "  --setuser USER    set uid to user or uid (and gid to user's gid)" << std::endl <<
+    "  --setgroup GROUP  set gid to group or gid" << std::endl <<
+    "  --version         show version and quit" << std::endl
+    << std::endl;
 
   if (is_server) {
-    cout << "\
-  -d                run in foreground, log to stderr.\n\
-  -f                run in foreground, log to usual location.\n";
-    cout << "\
-  --debug_ms N      set message debug level (e.g. 1)\n";
+    cout <<
+      "  -d                run in foreground, log to stderr" << std::endl <<
+      "  -f                run in foreground, log to usual location" << std::endl <<
+      std::endl <<
+      "  --debug_ms N      set message debug level (e.g. 1)" << std::endl;
   }
 
   cout.flush();
 }
 
+bool ceph_argparse_need_usage(const std::vector<const char*>& args)
+{
+  if (args.empty()) {
+    return true;
+  }
+  for (auto a : args) {
+    if (strcmp(a, "-h") == 0 ||
+	strcmp(a, "--help") == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void generic_server_usage()
 {
   generic_usage(true);
-  exit(1);
 }
+
 void generic_client_usage()
 {
   generic_usage(false);
-  exit(1);
 }

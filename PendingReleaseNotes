@@ -1,54 +1,28 @@
->= 11.0.0
-------
+>=15.0.0
+--------
 
-* The list of monitor hosts/addresses for building the monmap can now be
-  obtained from DNS SRV records. The service name used in when querying the DNS 
-  is defined in the "mon_dns_srv_name" config option, which defaults to
-  "ceph-mon".
+* The RGW "num_rados_handles" has been removed.
+  * If you were using a value of "num_rados_handles" greater than 1
+    multiply your current "objecter_inflight_ops" and 
+    "objecter_inflight_op_bytes" paramaeters by the old
+    "num_rados_handles" to get the same throttle behavior.
 
-* The 'osd class load list' config option is a list of object class names that
-  the OSD is permitted to load (or '*' for all classes). By default it
-  contains all existing in-tree classes for backwards compatibility.
+* Ceph now packages python bindings for python3.6 instead of
+  python3.4, because EPEL7 recently switched from python3.4 to
+  python3.6 as the native python3. see the `announcement <https://lists.fedoraproject.org/archives/list/epel-announce@lists.fedoraproject.org/message/EGUMKAIMPK2UD5VSHXM53BH2MBDGDWMO/>_`
+  for more details on the background of this change.
 
-* The 'osd class default list' config option is a list of object class names
-  (or '*' for all classes) that clients may invoke having only the '*', 'x',
-  'class-read', or 'class-write' capabilities. By default it contains all
-  existing in-tree classes for backwards compatibility. Invoking classes not
-  listed in 'osd class default list' requires a capability naming the class
-  (e.g. 'allow class foo').
+* librbd now uses a write-around cache policy be default,
+  replacing the previous write-back cache policy default.
+  This cache policy allows librbd to immediately complete
+  write IOs while they are still in-flight to the OSDs.
+  Subsequent flush requests will ensure all in-flight
+  write IOs are completed prior to completing. The
+  librbd cache policy can be controlled via a new
+  "rbd_cache_policy" configuration option.
 
-11.0.0
-------
-
-* If you have manually specified the monitor user rocksdb via the
-  ``mon keyvaluedb = rocksdb`` option, you will need to manually add a file
-  to the mon data directory to preserve this option::
-
-     echo rocksdb > /var/lib/ceph/mon/ceph-`hostname`/kv_backend
-
-  New monitors will now use rocksdb by default, but if that file is
-  not present, existing monitors will use leveldb.  The ``mon keyvaluedb`` option
-  now only affects the backend chosen when a monitor is created.
-
-* The 'osd crush initial weight' option allows you to specify a CRUSH
-  weight for a newly added OSD.  Previously a value of 0 (the default)
-  meant that we should use the size of the OSD's store to weight the
-  new OSD.  Now, a value of 0 means it should have a weight of 0, and
-  a negative value (the new default) means we should automatically
-  weight the OSD based on its size.  If your configuration file
-  explicitly specifies a value of 0 for this option you will need to
-  change it to a negative value (e.g., -1) to preserve the current
-  behavior.
-
-* The `osd crush location` config option is no longer supported.  Please
-  update your ceph.conf to use the `crush location` option instead.
-
-* The static libraries are not included by the debian development packages
-  (lib*-dev) any more. As it is not required per debian packaging policy.
-  And their shared versions are packaged as before.
-
-* The libtool pseudo-libraries (.la files) are not included by the debian
-  development packages (lib*-dev) any more. As it is unneeded, and per
-  https://wiki.debian.org/ReleaseGoals/LAFileRemoval and
-  https://www.debian.org/doc/manuals/maint-guide/advanced.en.html,
-  we should remove them.
+* librbd now includes a simple IO scheduler which attempts to
+  batch together multiple IOs against the same backing RBD
+  data block object. The librbd IO scheduler policy can be
+  controlled via a new "rbd_io_scheduler" configuration
+  option.

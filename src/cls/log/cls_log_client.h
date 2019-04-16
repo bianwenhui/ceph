@@ -1,8 +1,7 @@
 #ifndef CEPH_CLS_LOG_CLIENT_H
 #define CEPH_CLS_LOG_CLIENT_H
 
-#include "include/types.h"
-#include "include/rados/librados.hpp"
+#include "include/rados/librados_fwd.hpp"
 #include "cls_log_types.h"
 
 /*

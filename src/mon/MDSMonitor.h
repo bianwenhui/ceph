@@ -20,72 +20,57 @@
 
 #include <map>
 #include <set>
-using namespace std;
 
 #include "include/types.h"
-#include "mds/FSMap.h"
-#include "mds/MDSMap.h"
+#include "PaxosFSMap.h"
 #include "PaxosService.h"
 #include "msg/Messenger.h"
 #include "messages/MMDSBeacon.h"
+#include "CommandHandler.h"
 
-class MMonCommand;
-class MMDSLoadTargets;
-class MMDSMap;
 class FileSystemCommandHandler;
 
-#define MDS_HEALTH_PREFIX "mds_health"
-
-class MDSMonitor : public PaxosService {
+class MDSMonitor : public PaxosService, public PaxosFSMap, protected CommandHandler {
  public:
-  // mds maps
-  FSMap fsmap;           // current
-  bufferlist fsmap_bl;   // encoded
-
-  FSMap pending_fsmap;  // current + pending updates
-
-  // my helpers
-  void print_map(FSMap &m, int dbl=7);
-
-  class C_Updated : public Context {
-    MDSMonitor *mm;
-    MonOpRequestRef op;
-  public:
-    C_Updated(MDSMonitor *a, MonOpRequestRef c) :
-      mm(a), op(c) {}
-    void finish(int r) {
-      if (r >= 0)
-	mm->_updated(op);   // success
-      else if (r == -ECANCELED) {
-	mm->mon->no_reply(op);
-      } else {
-	mm->dispatch(op);        // try again
-      }
-    }
-  };
-
-  void create_new_fs(FSMap &m, const std::string &name, int metadata_pool, int data_pool);
-
-  version_t get_trim_to();
+  MDSMonitor(Monitor *mn, Paxos *p, string service_name);
 
   // service methods
-  void create_initial();
-  void update_from_paxos(bool *need_bootstrap);
-  void init();
-  void create_pending(); 
-  void encode_pending(MonitorDBStore::TransactionRef t);
+  void create_initial() override;
+  void get_store_prefixes(std::set<string>& s) const override;
+  void update_from_paxos(bool *need_bootstrap) override;
+  void init() override;
+  void create_pending() override; 
+  void encode_pending(MonitorDBStore::TransactionRef t) override;
   // we don't require full versions; don't encode any.
-  virtual void encode_full(MonitorDBStore::TransactionRef t) { }
+  void encode_full(MonitorDBStore::TransactionRef t) override { }
+  version_t get_trim_to() const override;
 
-  void update_logger();
+  bool preprocess_query(MonOpRequestRef op) override;  // true if processed.
+  bool prepare_update(MonOpRequestRef op) override;
+  bool should_propose(double& delay) override;
+
+  void on_active() override;
+  void on_restart() override;
+
+  void check_subs();
+  void check_sub(Subscription *sub);
+
+  void dump_info(Formatter *f);
+  int print_nodes(Formatter *f);
+
+  /**
+   * Return true if a blacklist was done (i.e. OSD propose needed)
+   */
+  bool fail_mds_gid(FSMap &fsmap, mds_gid_t gid);
+
+  bool is_leader() const override { return mon->is_leader(); }
+
+ protected:
+  // my helpers
+  template<int dblV = 7>
+  void print_map(const FSMap &m);
 
   void _updated(MonOpRequestRef op);
- 
-  bool preprocess_query(MonOpRequestRef op);  // true if processed.
-  bool prepare_update(MonOpRequestRef op);
-  bool should_propose(double& delay);
-
-  void on_active();
 
   void _note_beacon(class MMDSBeacon *m);
   bool preprocess_beacon(MonOpRequestRef op);
@@ -94,76 +79,47 @@ class MDSMonitor : public PaxosService {
   bool preprocess_offload_targets(MonOpRequestRef op);
   bool prepare_offload_targets(MonOpRequestRef op);
 
-  void get_health(list<pair<health_status_t,string> >& summary,
-		  list<pair<health_status_t,string> > *detail,
-		  CephContext *cct) const override;
-  int fail_mds(std::ostream &ss, const std::string &arg);
-  /**
-   * Return true if a blacklist was done (i.e. OSD propose needed)
-   */
-  bool fail_mds_gid(mds_gid_t gid);
+  int fail_mds(FSMap &fsmap, std::ostream &ss,
+      const std::string &arg,
+      MDSMap::mds_info_t *failed_info);
 
   bool preprocess_command(MonOpRequestRef op);
   bool prepare_command(MonOpRequestRef op);
 
-  int parse_role(
-      const std::string &role_str,
-      mds_role_t *role,
-      std::ostream &ss);
-
-  int management_command(
-      MonOpRequestRef op,
-      std::string const &prefix,
-      map<string, cmd_vartype> &cmdmap,
-      std::stringstream &ss);
-  void modify_legacy_filesystem(
-      std::function<void(std::shared_ptr<Filesystem> )> fn);
-  int legacy_filesystem_command(
-      MonOpRequestRef op,
-      std::string const &prefix,
-      map<string, cmd_vartype> &cmdmap,
-      std::stringstream &ss);
   int filesystem_command(
+      FSMap &fsmap,
       MonOpRequestRef op,
       std::string const &prefix,
-      map<string, cmd_vartype> &cmdmap,
+      const cmdmap_t& cmdmap,
       std::stringstream &ss);
 
   // beacons
   struct beacon_info_t {
-    utime_t stamp;
-    uint64_t seq;
+    mono_time stamp = mono_clock::zero();
+    uint64_t seq = 0;
+    beacon_info_t() {}
+    beacon_info_t(mono_time stamp, uint64_t seq) : stamp(stamp), seq(seq) {}
   };
   map<mds_gid_t, beacon_info_t> last_beacon;
 
-  bool try_standby_replay(
-      const MDSMap::mds_info_t& finfo,
-      const Filesystem &leader_fs,
-      const MDSMap::mds_info_t& ainfo);
-
   std::list<std::shared_ptr<FileSystemCommandHandler> > handlers;
 
-public:
-  MDSMonitor(Monitor *mn, Paxos *p, string service_name);
+  bool maybe_promote_standby(FSMap& fsmap, Filesystem& fs);
+  bool maybe_resize_cluster(FSMap &fsmap, fs_cluster_id_t fscid);
+  void maybe_replace_gid(FSMap &fsmap, mds_gid_t gid,
+      const MDSMap::mds_info_t& info, bool *mds_propose, bool *osd_propose);
+  void tick() override;     // check state, take actions
 
-  bool maybe_promote_standby(std::shared_ptr<Filesystem> fs);
-  bool maybe_expand_cluster(std::shared_ptr<Filesystem> fs);
-  void maybe_replace_gid(mds_gid_t gid, const beacon_info_t &beacon,
-      bool *mds_propose, bool *osd_propose);
-  void tick();     // check state, take actions
+  int dump_metadata(const FSMap &fsmap, const std::string &who, Formatter *f,
+      ostream& err);
 
-  void dump_info(Formatter *f);
-  int dump_metadata(const string& who, Formatter *f, ostream& err);
-  int print_nodes(Formatter *f);
-
-  void check_subs();
-  void check_sub(Subscription *sub);
-
-private:
-  MDSMap *generate_mds_map(fs_cluster_id_t fscid);
   void update_metadata(mds_gid_t gid, const Metadata& metadata);
-  void remove_from_metadata(MonitorDBStore::TransactionRef t);
+  void remove_from_metadata(const FSMap &fsmap, MonitorDBStore::TransactionRef t);
   int load_metadata(map<mds_gid_t, Metadata>& m);
+  void count_metadata(const std::string& field, Formatter *f);
+public:
+  void count_metadata(const std::string& field, map<string,int> *out);
+protected:
 
   // MDS daemon GID to latest health state from that GID
   std::map<uint64_t, MDSHealth> pending_daemon_health;
@@ -171,8 +127,12 @@ private:
 
   map<mds_gid_t, Metadata> pending_metadata;
 
-  int _check_pool(const int64_t pool_id, std::stringstream *ss) const;
-  mds_gid_t gid_from_arg(const std::string& arg, std::ostream& err);
+  mds_gid_t gid_from_arg(const FSMap &fsmap, const std::string &arg, std::ostream& err);
+
+  // When did the mon last call into our tick() method?  Used for detecting
+  // when the mon was not updating us for some period (e.g. during slow
+  // election) to reset last_beacon timeouts
+  mono_time last_tick = mono_clock::zero();
 };
 
 #endif

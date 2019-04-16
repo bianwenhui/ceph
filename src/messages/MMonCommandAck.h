@@ -17,37 +17,41 @@
 
 #include "messages/PaxosServiceMessage.h"
 
-class MMonCommandAck : public PaxosServiceMessage {
- public:
-  vector<string> cmd;
+class MMonCommandAck : public MessageInstance<MMonCommandAck, PaxosServiceMessage> {
+public:
+  friend factory;
+
+  std::vector<std::string> cmd;
   errorcode32_t r;
-  string rs;
-  
-  MMonCommandAck() : PaxosServiceMessage(MSG_MON_COMMAND_ACK, 0) {}
-  MMonCommandAck(vector<string>& c, int _r, string s, version_t v) : 
-    PaxosServiceMessage(MSG_MON_COMMAND_ACK, v),
+  std::string rs;
+
+  MMonCommandAck() : MessageInstance(MSG_MON_COMMAND_ACK, 0) {}
+  MMonCommandAck(std::vector<std::string>& c, int _r, std::string s, version_t v) : 
+    MessageInstance(MSG_MON_COMMAND_ACK, v),
     cmd(c), r(_r), rs(s) { }
 private:
-  ~MMonCommandAck() {}
+  ~MMonCommandAck() override {}
 
 public:
-  const char *get_type_name() const { return "mon_command"; }
-  void print(ostream& o) const {
+  std::string_view get_type_name() const override { return "mon_command"; }
+  void print(std::ostream& o) const override {
     o << "mon_command_ack(" << cmd << "=" << r << " " << rs << " v" << version << ")";
   }
   
-  void encode_payload(uint64_t features) {
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
     paxos_encode();
-    ::encode(r, payload);
-    ::encode(rs, payload);
-    ::encode(cmd, payload);
+    encode(r, payload);
+    encode(rs, payload);
+    encode(cmd, payload);
   }
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
+  void decode_payload() override {
+    using ceph::decode;
+    auto p = payload.cbegin();
     paxos_decode(p);
-    ::decode(r, p);
-    ::decode(rs, p);
-    ::decode(cmd, p);
+    decode(r, p);
+    decode(rs, p);
+    decode(cmd, p);
   }
 };
 

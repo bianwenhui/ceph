@@ -24,14 +24,18 @@ and tools::
 Build Ceph
 ==========
 
-Ceph provides ``automake`` and ``configure`` scripts to streamline the build 
-process. To build Ceph, navigate to your cloned Ceph repository and execute the 
-following::
+Ceph is built using cmake. To build Ceph, navigate to your cloned Ceph
+repository and execute the following::
 
-	cd ceph
-	./autogen.sh
-	./configure
-	make
+    cd ceph
+    ./do_cmake.sh
+    cd build
+    make
+
+.. note:: By default do_cmake.sh will build a debug version of ceph that may
+   perform up to 5 times slower with certain workloads. Pass 
+   '-DCMAKE_BUILD_TYPE=RelWithDebInfo' to do_cmake.sh if you would like to
+   build a release version of the ceph executables instead.
 
 .. topic:: Hyperthreading
 
@@ -83,11 +87,11 @@ Once you have installed the tools, setup an RPM compilation environment::
 
 Fetch the source tarball for the RPM compilation environment::
 
-	wget -P ~/rpmbuild/SOURCES/ http://ceph.com/download/ceph-<version>.tar.bz2
+	wget -P ~/rpmbuild/SOURCES/ https://download.ceph.com/tarballs/ceph-<version>.tar.bz2
 
 Or from the EU mirror::
 
-	wget -P ~/rpmbuild/SOURCES/ http://eu.ceph.com/download/ceph-<version>.tar.bz2
+	wget -P ~/rpmbuild/SOURCES/ http://eu.ceph.com/tarballs/ceph-<version>.tar.bz2
 
 Extract the specfile::
 

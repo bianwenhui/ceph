@@ -18,7 +18,7 @@
 #include "include/Context.h"
 #include "Client.h"
 #include "barrier.h"
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 #undef dout_prefix
 #define dout_prefix *_dout << "client." << whoami << " "
@@ -29,6 +29,24 @@
   *_dout << "client." << cl->whoami << " "
 
 /* C_Block_Sync */
+class C_Block_Sync : public Context {
+private:
+  Client *cl;
+  uint64_t ino;
+  barrier_interval iv;
+  enum CBlockSync_State state;
+  Barrier *barrier;
+  int *rval; /* see Cond.h */
+
+public:
+  boost::intrusive::list_member_hook<> intervals_hook;
+  C_Block_Sync(Client *c, uint64_t i, barrier_interval iv, int *r);
+  void finish(int rval);
+
+  friend class Barrier;
+  friend class BarrierContext;
+};
+
 C_Block_Sync::C_Block_Sync(Client *c, uint64_t i, barrier_interval iv,
 			   int *r=0) :
   cl(c), ino(i), iv(iv), rval(r)
@@ -67,14 +85,14 @@ BarrierContext::BarrierContext(Client *c, uint64_t ino) :
 
 void BarrierContext::write_nobarrier(C_Block_Sync &cbs)
 {
-  Mutex::Locker locker(lock);
+  std::lock_guard locker(lock);
   cbs.state = CBlockSync_State_Unclaimed;
   outstanding_writes.push_back(cbs);
 }
 
 void BarrierContext::write_barrier(C_Block_Sync &cbs)
 {
-  Mutex::Locker locker(lock);
+  std::lock_guard locker(lock);
   barrier_interval &iv = cbs.iv;
 
   { /* find blocking commit--intrusive no help here */
@@ -99,7 +117,7 @@ void BarrierContext::write_barrier(C_Block_Sync &cbs)
 
 void BarrierContext::commit_barrier(barrier_interval &civ)
 {
-    Mutex::Locker locker(lock);
+    std::lock_guard locker(lock);
 
     /* we commit outstanding writes--if none exist, we don't care */
     if (outstanding_writes.size() == 0)
@@ -141,7 +159,7 @@ void BarrierContext::commit_barrier(barrier_interval &civ)
 
 void BarrierContext::complete(C_Block_Sync &cbs)
 {
-    Mutex::Locker locker(lock);
+    std::lock_guard locker(lock);
     BlockSyncList::iterator iter =
       BlockSyncList::s_iterator_to(cbs);
 
@@ -166,7 +184,7 @@ void BarrierContext::complete(C_Block_Sync &cbs)
     }
     break;
     default:
-      assert(false);
+      ceph_abort();
       break;
     }
 

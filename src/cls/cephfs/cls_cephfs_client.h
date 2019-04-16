@@ -1,7 +1,6 @@
 
-#include "include/rados/librados.hpp"
+#include "include/rados/librados_fwd.hpp"
 #include "mds/mdstypes.h"
-
 #include "cls_cephfs.h"
 
 class AccumulateArgs;
@@ -22,6 +21,10 @@ class ClsCephFSClient
       inode_backtrace_t *backtrace,
       file_layout_t *layout,
       AccumulateResult *result);
+
+  static int delete_inode_accumulate_result(
+      librados::IoCtx &ctx,
+      const std::string &oid);
 
   static void build_tag_filter(
       const std::string &scrub_tag,

@@ -7,25 +7,6 @@
 #include "include/stringify.h"
 
 // bluefs_extent_t
-
-void bluefs_extent_t::encode(bufferlist& bl) const
-{
-  ENCODE_START(1, 1, bl);
-  ::encode(offset, bl);
-  ::encode(length, bl);
-  ::encode(bdev, bl);
-  ENCODE_FINISH(bl);
-}
-
-void bluefs_extent_t::decode(bufferlist::iterator& p)
-{
-  DECODE_START(1, p);
-  ::decode(offset, p);
-  ::decode(length, p);
-  ::decode(bdev, p);
-  DECODE_FINISH(p);
-}
-
 void bluefs_extent_t::dump(Formatter *f) const
 {
   f->dump_unsigned("offset", offset);
@@ -42,9 +23,10 @@ void bluefs_extent_t::generate_test_instances(list<bluefs_extent_t*>& ls)
   ls.back()->bdev = 1;
 }
 
-ostream& operator<<(ostream& out, bluefs_extent_t e)
+ostream& operator<<(ostream& out, const bluefs_extent_t& e)
 {
-  return out << e.bdev << ":" << e.offset << "+" << e.length;
+  return out << (int)e.bdev << ":0x" << std::hex << e.offset << "~" << e.length
+	     << std::dec;
 }
 
 // bluefs_super_t
@@ -52,22 +34,22 @@ ostream& operator<<(ostream& out, bluefs_extent_t e)
 void bluefs_super_t::encode(bufferlist& bl) const
 {
   ENCODE_START(1, 1, bl);
-  ::encode(uuid, bl);
-  ::encode(osd_uuid, bl);
-  ::encode(version, bl);
-  ::encode(block_size, bl);
-  ::encode(log_fnode, bl);
+  encode(uuid, bl);
+  encode(osd_uuid, bl);
+  encode(version, bl);
+  encode(block_size, bl);
+  encode(log_fnode, bl);
   ENCODE_FINISH(bl);
 }
 
-void bluefs_super_t::decode(bufferlist::iterator& p)
+void bluefs_super_t::decode(bufferlist::const_iterator& p)
 {
   DECODE_START(1, p);
-  ::decode(uuid, p);
-  ::decode(osd_uuid, p);
-  ::decode(version, p);
-  ::decode(block_size, p);
-  ::decode(log_fnode, p);
+  decode(uuid, p);
+  decode(osd_uuid, p);
+  decode(version, p);
+  decode(block_size, p);
+  decode(log_fnode, p);
   DECODE_FINISH(p);
 }
 
@@ -93,17 +75,17 @@ ostream& operator<<(ostream& out, const bluefs_super_t& s)
   return out << "super(uuid " << s.uuid
 	     << " osd " << s.osd_uuid
 	     << " v " << s.version
-	     << " block_size " << s.block_size
-	     << " log_fnode " << s.log_fnode
-	     << ")";
+	     << " block_size 0x" << std::hex << s.block_size
+	     << " log_fnode 0x" << s.log_fnode
+	     << std::dec << ")";
 }
 
 // bluefs_fnode_t
 
-vector<bluefs_extent_t>::iterator bluefs_fnode_t::seek(
+mempool::bluefs::vector<bluefs_extent_t>::iterator bluefs_fnode_t::seek(
   uint64_t offset, uint64_t *x_off)
 {
-  vector<bluefs_extent_t>::iterator p = extents.begin();
+  auto p = extents.begin();
   while (p != extents.end()) {
     if ((int64_t) offset >= p->length) {
       offset -= p->length;
@@ -114,28 +96,6 @@ vector<bluefs_extent_t>::iterator bluefs_fnode_t::seek(
   }
   *x_off = offset;
   return p;
-}
-
-void bluefs_fnode_t::encode(bufferlist& bl) const
-{
-  ENCODE_START(1, 1, bl);
-  ::encode(ino, bl);
-  ::encode(size, bl);
-  ::encode(mtime, bl);
-  ::encode(prefer_bdev, bl);
-  ::encode(extents, bl);
-  ENCODE_FINISH(bl);
-}
-
-void bluefs_fnode_t::decode(bufferlist::iterator& p)
-{
-  DECODE_START(1, p);
-  ::decode(ino, p);
-  ::decode(size, p);
-  ::decode(mtime, p);
-  ::decode(prefer_bdev, p);
-  ::decode(extents, p);
-  DECODE_FINISH(p);
 }
 
 void bluefs_fnode_t::dump(Formatter *f) const
@@ -164,9 +124,10 @@ void bluefs_fnode_t::generate_test_instances(list<bluefs_fnode_t*>& ls)
 ostream& operator<<(ostream& out, const bluefs_fnode_t& file)
 {
   return out << "file(ino " << file.ino
-	     << " size " << file.size
+	     << " size 0x" << std::hex << file.size << std::dec
 	     << " mtime " << file.mtime
 	     << " bdev " << (int)file.prefer_bdev
+	     << " allocated " << std::hex << file.allocated << std::dec
 	     << " extents " << file.extents
 	     << ")";
 }
@@ -178,21 +139,27 @@ void bluefs_transaction_t::encode(bufferlist& bl) const
 {
   uint32_t crc = op_bl.crc32c(-1);
   ENCODE_START(1, 1, bl);
-  ::encode(uuid, bl);
-  ::encode(seq, bl);
-  ::encode(op_bl, bl);
-  ::encode(crc, bl);
+  encode(uuid, bl);
+  encode(seq, bl);
+  // not using bufferlist encode method, as it merely copies the bufferptr and not
+  // contents, meaning we're left with fragmented target bl
+  __u32 len = op_bl.length();
+  encode(len, bl);
+  for (auto& it : op_bl.buffers()) {
+    bl.append(it.c_str(),  it.length());
+  }
+  encode(crc, bl);
   ENCODE_FINISH(bl);
 }
 
-void bluefs_transaction_t::decode(bufferlist::iterator& p)
+void bluefs_transaction_t::decode(bufferlist::const_iterator& p)
 {
   uint32_t crc;
   DECODE_START(1, p);
-  ::decode(uuid, p);
-  ::decode(seq, p);
-  ::decode(op_bl, p);
-  ::decode(crc, p);
+  decode(uuid, p);
+  decode(seq, p);
+  decode(op_bl, p);
+  decode(crc, p);
   DECODE_FINISH(p);
   uint32_t actual = op_bl.crc32c(-1);
   if (actual != crc)
@@ -208,7 +175,7 @@ void bluefs_transaction_t::dump(Formatter *f) const
   f->dump_unsigned("crc", op_bl.crc32c(-1));
 }
 
-void bluefs_transaction_t::generate_test_instance(
+void bluefs_transaction_t::generate_test_instances(
   list<bluefs_transaction_t*>& ls)
 {
   ls.push_back(new bluefs_transaction_t);
@@ -230,7 +197,7 @@ void bluefs_transaction_t::generate_test_instance(
 ostream& operator<<(ostream& out, const bluefs_transaction_t& t)
 {
   return out << "txn(seq " << t.seq
-	     << " len " << t.op_bl.length()
-	     << " crc " << t.op_bl.crc32c(-1)
-	     << ")";
+	     << " len 0x" << std::hex << t.op_bl.length()
+	     << " crc 0x" << t.op_bl.crc32c(-1)
+	     << std::dec << ")";
 }

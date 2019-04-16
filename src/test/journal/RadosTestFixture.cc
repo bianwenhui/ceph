@@ -1,10 +1,12 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include "test/librados/test_cxx.h"
 #include "test/journal/RadosTestFixture.h"
 #include "cls/journal/cls_journal_client.h"
 #include "include/stringify.h"
 #include "common/WorkQueue.h"
+#include "journal/Settings.h"
 
 RadosTestFixture::RadosTestFixture()
   : m_timer_lock("m_timer_lock"), m_timer(NULL), m_listener(this) {
@@ -21,10 +23,10 @@ void RadosTestFixture::SetUpTestCase() {
 }
 
 void RadosTestFixture::TearDownTestCase() {
-  ASSERT_EQ(0, destroy_one_pool_pp(_pool_name, _rados));
-
   _thread_pool->stop();
   delete _thread_pool;
+
+  ASSERT_EQ(0, destroy_one_pool_pp(_pool_name, _rados));
 }
 
 std::string RadosTestFixture::get_temp_oid() {
@@ -67,10 +69,15 @@ int RadosTestFixture::create(const std::string &oid, uint8_t order,
 
 journal::JournalMetadataPtr RadosTestFixture::create_metadata(
     const std::string &oid, const std::string &client_id,
-    double commit_internal) {
+    double commit_interval, uint64_t max_fetch_bytes,
+    int max_concurrent_object_sets) {
+  journal::Settings settings;
+  settings.commit_interval = commit_interval;
+  settings.max_fetch_bytes = max_fetch_bytes;
+  settings.max_concurrent_object_sets = max_concurrent_object_sets;
+
   journal::JournalMetadataPtr metadata(new journal::JournalMetadata(
-    m_work_queue, m_timer, &m_timer_lock, m_ioctx, oid, client_id,
-    commit_internal));
+    m_work_queue, m_timer, &m_timer_lock, m_ioctx, oid, client_id, settings));
   m_metadatas.push_back(metadata);
   return metadata;
 }
@@ -113,8 +120,7 @@ bool RadosTestFixture::wait_for_update(journal::JournalMetadataPtr metadata) {
   Mutex::Locker locker(m_listener.mutex);
   while (m_listener.updates[metadata.get()] == 0) {
     if (m_listener.cond.WaitInterval(
-          reinterpret_cast<CephContext*>(m_ioctx.cct()),
-          m_listener.mutex, utime_t(10, 0)) != 0) {
+	  m_listener.mutex, utime_t(10, 0)) != 0) {
       return false;
     }
   }

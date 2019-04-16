@@ -4,11 +4,14 @@
 #include "include/compat.h"
 #include "CrushLocation.h"
 #include "CrushWrapper.h"
+#include "common/ceph_context.h"
 #include "common/config.h"
 #include "include/str_list.h"
 #include "common/debug.h"
+#include "common/errno.h"
+#include "include/compat.h"
 
-#include <common/SubProcess.h>
+#include "common/SubProcess.h"
 
 #include <vector>
 
@@ -41,6 +44,12 @@ int CrushLocation::update_from_hook()
 {
   if (cct->_conf->crush_location_hook.length() == 0)
     return 0;
+ 
+  if (0 != access(cct->_conf->crush_location_hook.c_str(), R_OK)) {
+    lderr(cct) << "the user define crush location hook: " << cct->_conf->crush_location_hook
+               << " may not exist or can not access it" << dendl;
+    return errno;
+  }
 
   SubProcessTimed hook(
     cct->_conf->crush_location_hook.c_str(),
@@ -58,24 +67,26 @@ int CrushLocation::update_from_hook()
     return ret;
   }
 
-  bufferlist bl;
+  ceph::buffer::list bl;
   ret = bl.read_fd(hook.get_stdout(), 100 * 1024);
   if (ret < 0) {
     lderr(cct) << "error: failed read stdout from "
 	       << cct->_conf->crush_location_hook
 	       << ": " << cpp_strerror(-ret) << dendl;
-    bufferlist err;
+    ceph::buffer::list err;
     err.read_fd(hook.get_stderr(), 100 * 1024);
     lderr(cct) << "stderr:\n";
     err.hexdump(*_dout);
     *_dout << dendl;
-    return ret;
   }
 
   if (hook.join() != 0) {
     lderr(cct) << "error: failed to join: " << hook.err() << dendl;
     return -EINVAL;
   }
+
+  if (ret < 0)
+    return ret;
 
   std::string out;
   bl.copy(0, bl.length(), out);
@@ -106,8 +117,8 @@ int CrushLocation::init_on_startup()
   }
   std::lock_guard<std::mutex> l(lock);
   loc.clear();
-  loc.insert(make_pair<std::string,std::string>("host", hostname));
-  loc.insert(make_pair<std::string,std::string>("root", "default"));
+  loc.insert(std::make_pair<std::string,std::string>("host", hostname));
+  loc.insert(std::make_pair<std::string,std::string>("root", "default"));
   lgeneric_dout(cct, 10) << "crush_location is (default) " << loc << dendl;
   return 0;
 }

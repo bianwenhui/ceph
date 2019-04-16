@@ -7,11 +7,13 @@
 #include "include/int_types.h"
 #include "common/Mutex.h"
 #include "common/RefCountedObj.h"
+#include "include/Context.h"
 #include "journal/Future.h"
 #include <list>
+#include <map>
 #include <boost/noncopyable.hpp>
 #include <boost/intrusive_ptr.hpp>
-#include "include/assert.h"
+#include "include/ceph_assert.h"
 
 class Context;
 
@@ -56,7 +58,7 @@ public:
   }
   inline void set_flush_in_progress() {
     Mutex::Locker locker(m_lock);
-    assert(m_flush_handler);
+    ceph_assert(m_flush_handler);
     m_flush_handler.reset();
     m_flush_state = FLUSH_STATE_IN_PROGRESS;
   }
@@ -76,6 +78,7 @@ public:
 private:
   friend std::ostream &operator<<(std::ostream &, const FutureImpl &);
 
+  typedef std::map<FlushHandlerPtr, FutureImplPtr> FlushHandlers;
   typedef std::list<Context *> Contexts;
 
   enum FlushState {
@@ -87,11 +90,11 @@ private:
   struct C_ConsistentAck : public Context {
     FutureImplPtr future;
     C_ConsistentAck(FutureImpl *_future) : future(_future) {}
-    virtual void complete(int r) {
+    void complete(int r) override {
       future->consistent(r);
       future.reset();
     }
-    virtual void finish(int r) {}
+    void finish(int r) override {}
   };
 
   uint64_t m_tag_tid;
@@ -109,6 +112,9 @@ private:
 
   C_ConsistentAck m_consistent_ack;
   Contexts m_contexts;
+
+  FutureImplPtr prepare_flush(FlushHandlers *flush_handlers);
+  FutureImplPtr prepare_flush(FlushHandlers *flush_handlers, Mutex &lock);
 
   void consistent(int r);
   void finish_unlock();

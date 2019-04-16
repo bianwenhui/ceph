@@ -1,3 +1,5 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// vim: ts=8 sw=2 smarttab
 #ifndef CEPH_CLASSHANDLER_H
 #define CEPH_CLASSHANDLER_H
 
@@ -26,7 +28,7 @@ public:
     void unregister();
 
     int get_flags() {
-      Mutex::Locker l(cls->handler->mutex);
+      std::lock_guard l(cls->handler->mutex);
       return flags;
     }
 
@@ -34,7 +36,7 @@ public:
   };
 
   struct ClassFilter {
-    struct ClassHandler::ClassData *cls;
+    struct ClassHandler::ClassData *cls = nullptr;
     std::string name;
     cls_cxx_filter_factory_t fn;
 
@@ -57,7 +59,7 @@ public:
     ClassHandler *handler;
     void *handle;
 
-    bool whitelisted;
+    bool whitelisted = false;
 
     map<string, ClassMethod> methods_map;
     map<string, ClassFilter> filters_map;
@@ -82,14 +84,14 @@ public:
     void unregister_filter(ClassFilter *method);
 
     ClassMethod *get_method(const char *mname) {
-      Mutex::Locker l(handler->mutex);
+      std::lock_guard l(handler->mutex);
       return _get_method(mname);
     }
     int get_method_flags(const char *mname);
 
     ClassFilter *get_filter(const std::string &filter_name)
     {
-      Mutex::Locker l(handler->mutex);
+      std::lock_guard l(handler->mutex);
       std::map<std::string, ClassFilter>::iterator i = filters_map.find(filter_name);
       if (i == filters_map.end()) {
         return NULL;
@@ -100,7 +102,6 @@ public:
   };
 
 private:
-  Mutex mutex;
   map<string, ClassData> classes;
 
   ClassData *_get_class(const string& cname, bool check_allowed);
@@ -110,10 +111,13 @@ private:
       const std::string& list);
 
 public:
+  Mutex mutex;
+
   explicit ClassHandler(CephContext *cct_) : cct(cct_), mutex("ClassHandler") {}
-  
+
   int open_all_classes();
 
+  void add_embedded_class(const string& cname);
   int open_class(const string& cname, ClassData **pcls);
   
   ClassData *register_class(const char *cname);

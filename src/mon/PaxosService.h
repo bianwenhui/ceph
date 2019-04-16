@@ -53,7 +53,9 @@ class PaxosService {
    */
   bool proposing;
 
- protected:
+  bool need_immediate_propose = false;
+
+protected:
   /**
    * Services implementing us used to depend on the Paxos version, back when
    * each service would have a Paxos instance for itself. However, now we only
@@ -75,14 +77,22 @@ class PaxosService {
    */
   bool have_pending; 
 
+  /**
+   * health checks for this service
+   *
+   * Child must populate this during encode_pending() by calling encode_health().
+   */
+  health_check_map_t health_checks;
 protected:
-
   /**
    * format of our state in leveldb, 0 for default
    */
   version_t format_version;
 
-
+public:
+  const health_check_map_t& get_health_checks() const {
+    return health_checks;
+  }
 
   /**
    * @defgroup PaxosService_h_callbacks Callback classes
@@ -104,84 +114,20 @@ protected:
   public:
     C_RetryMessage(PaxosService *s, MonOpRequestRef op_) :
       C_MonOp(op_), svc(s) { }
-    void _finish(int r) {
+    void _finish(int r) override {
       if (r == -EAGAIN || r >= 0)
 	svc->dispatch(op);
       else if (r == -ECANCELED)
         return;
       else
-	assert(0 == "bad C_RetryMessage return value");
+	ceph_abort_msg("bad C_RetryMessage return value");
     }
   };
 
-  /**
-   * Callback used to make sure we call the PaxosService::_active function
-   * whenever a condition is fulfilled.
-   *
-   * This is used in multiple situations, from waiting for the Paxos to commit
-   * our proposed value, to waiting for the Paxos to become active once an
-   * election is finished.
-   */
-  class C_Active : public Context {
-    PaxosService *svc;
-  public:
-    explicit C_Active(PaxosService *s) : svc(s) {}
-    void finish(int r) {
-      if (r >= 0)
-	svc->_active();
-    }
-  };
-
-  /**
-   * Callback class used to propose the pending value once the proposal_timer
-   * fires up.
-   */
-  class C_Propose : public Context {
-    PaxosService *ps;
-  public:
-    explicit C_Propose(PaxosService *p) : ps(p) { }
-    void finish(int r) {
-      ps->proposal_timer = 0;
-      if (r >= 0)
-	ps->propose_pending();
-      else if (r == -ECANCELED || r == -EAGAIN)
-	return;
-      else
-	assert(0 == "bad return value for C_Propose");
-    }
-  };
-
-  /**
-   * Callback class used to mark us as active once a proposal finishes going
-   * through Paxos.
-   *
-   * We should wake people up *only* *after* we inform the service we
-   * just went active. And we should wake people up only once we finish
-   * going active. This is why we first go active, avoiding to wake up the
-   * wrong people at the wrong time, such as waking up a C_RetryMessage
-   * before waking up a C_Active, thus ending up without a pending value.
-   */
-  class C_Committed : public Context {
-    PaxosService *ps;
-  public:
-    explicit C_Committed(PaxosService *p) : ps(p) { }
-    void finish(int r) {
-      ps->proposing = false;
-      if (r >= 0)
-	ps->_active();
-      else if (r == -ECANCELED || r == -EAGAIN)
-	return;
-      else
-	assert(0 == "bad return value for C_Committed");
-    }
-  };
   /**
    * @}
    */
-  friend class C_Propose;
-  
 
-public:
   /**
    * @param mn A Monitor instance
    * @param p A Paxos instance
@@ -206,12 +152,12 @@ public:
    *
    * @returns The service's name.
    */
-  string get_service_name() { return service_name; }
+  const string& get_service_name() const { return service_name; }
 
   /**
    * Get the store prefixes we utilize
    */
-  virtual void get_store_prefixes(set<string>& s) {
+  virtual void get_store_prefixes(set<string>& s) const {
     s.insert(service_name);
   }
   
@@ -250,7 +196,7 @@ private:
    * @remarks We only create a pending state we our Monitor is the Leader.
    *
    * @pre Paxos is active
-   * @post have_pending is true iif our Monitor is the Leader and Paxos is
+   * @post have_pending is true if our Monitor is the Leader and Paxos is
    *	   active
    */
   void _active();
@@ -285,7 +231,7 @@ public:
    * request on hold, for instance.
    */
   void request_proposal() {
-    assert(is_writeable());
+    ceph_assert(is_writeable());
 
     propose_pending();
   }
@@ -297,8 +243,8 @@ public:
    * set a flag stating we're waiting on a cross-proposal to be finished.
    */
   void request_proposal(PaxosService *other) {
-    assert(other != NULL);
-    assert(other->is_writeable());
+    ceph_assert(other != NULL);
+    ceph_assert(other->is_writeable());
 
     other->request_proposal();
   }
@@ -420,6 +366,15 @@ public:
   virtual bool should_propose(double &delay);
 
   /**
+   * force an immediate propose.
+   *
+   * This is meant to be called from prepare_update(op).
+   */
+  void force_immediate_propose() {
+    need_immediate_propose = true;
+  }
+
+  /**
    * @defgroup PaxosService_h_courtesy Courtesy functions
    *
    * Courtesy functions, in case the class implementing this service has
@@ -470,17 +425,15 @@ public:
    */
   virtual void tick() {}
 
-  /**
-   * Get health information
-   *
-   * @param summary list of summary strings and associated severity
-   * @param detail optional list of detailed problem reports; may be NULL
-   */
-  virtual void get_health(list<pair<health_status_t,string> >& summary,
-			  list<pair<health_status_t,string> > *detail,
-			  CephContext *cct) const { }
+  void encode_health(const health_check_map_t& next,
+		     MonitorDBStore::TransactionRef t) {
+    bufferlist bl;
+    encode(next, bl);
+    t->put("health", service_name, bl);
+    mon->log_health(next, health_checks, t);
+  }
+  void load_health();
 
- private:
   /**
    * @defgroup PaxosService_h_store_keys Set of keys that are usually used on
    *					 all the services implementing this
@@ -497,6 +450,7 @@ public:
    * @}
    */
 
+ private:
   /**
    * @defgroup PaxosService_h_version_cache Variables holding cached values
    *                                        for the most used versions (first
@@ -527,7 +481,7 @@ public:
    *
    * @returns true if we are proposing; false otherwise.
    */
-  bool is_proposing() {
+  bool is_proposing() const {
     return proposing;
   }
 
@@ -538,7 +492,7 @@ public:
    *
    * @returns true if in state ACTIVE; false otherwise.
    */
-  bool is_active() {
+  bool is_active() const {
     return
       !is_proposing() &&
       (paxos->is_active() || paxos->is_updating() || paxos->is_writing());
@@ -556,7 +510,7 @@ public:
    * @param ver The version we want to check if is readable
    * @returns true if it is readable; false otherwise
    */
-  bool is_readable(version_t ver = 0) {
+  bool is_readable(version_t ver = 0) const {
     if (ver > get_last_committed() ||
 	!paxos->is_readable(0) ||
 	get_last_committed() == 0)
@@ -575,20 +529,7 @@ public:
    *
    * @returns true if writeable; false otherwise
    */
-  bool is_writeable() {
-    return
-      !is_proposing() &&
-      is_write_ready() &&
-      (paxos->is_active() || paxos->is_updating() || paxos->is_writing());
-  }
-
-  /**
-   * Check if we are ready to be written to.  This means we must have a
-   * pending value and be active.
-   *
-   * @returns true if we are ready to be written to; false otherwise.
-   */
-  bool is_write_ready() {
+  bool is_writeable() const {
     return is_active() && have_pending;
   }
 
@@ -674,7 +615,7 @@ public:
 
     if (is_proposing())
       wait_for_finished_proposal(op, c);
-    else if (!is_write_ready())
+    else if (!is_writeable())
       wait_for_active(op, c);
     else
       paxos->wait_for_writeable(op, c);
@@ -723,7 +664,7 @@ public:
    * @returns the version we should trim to; if we return zero, it should be
    *	      assumed that there's no version to trim to.
    */
-  virtual version_t get_trim_to() {
+  virtual version_t get_trim_to() const {
     return 0;
   }
 
@@ -741,7 +682,7 @@ public:
    * @note We force every service to implement this function, since we strongly
    *	   desire the encoding of full versions.
    * @note Services that do not trim their state, will be bound to only create
-   *	   one full version. Full version stashing is determined/controled by
+   *	   one full version. Full version stashing is determined/controlled by
    *	   trimming: we stash a version each time a trim is bound to erase the
    *	   latest full version.
    *
@@ -838,6 +779,18 @@ public:
   void put_value(MonitorDBStore::TransactionRef t,
 		 const string& key, bufferlist& bl) {
     t->put(get_service_name(), key, bl);
+  }
+
+  /**
+   * Put integer value @v into the key @p key.
+   *
+   * @param t A transaction to which we will add this put operation
+   * @param key The key to which we will add the value
+   * @param v An integer
+   */
+  void put_value(MonitorDBStore::TransactionRef t,
+		 const string& key, version_t v) {
+    t->put(get_service_name(), key, v);
   }
 
   /**

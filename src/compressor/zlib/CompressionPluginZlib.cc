@@ -14,31 +14,10 @@
 
 
 // -----------------------------------------------------------------------------
+#include "acconfig.h"
 #include "ceph_ver.h"
-#include "compressor/CompressionPlugin.h"
-#include "ZlibCompressor.h"
-#include "common/debug.h"
-
-#define dout_subsys ceph_subsys_mon
-// -----------------------------------------------------------------------------
-
-class CompressionPluginZlib : public CompressionPlugin {
-public:
-
-  explicit CompressionPluginZlib(CephContext *cct) : CompressionPlugin(cct)
-  {}
-
-  virtual int factory(CompressorRef *cs,
-                      ostream *ss)
-  {
-    if (compressor == 0) {
-      ZlibCompressor *interface = new ZlibCompressor();
-      compressor = CompressorRef(interface);
-    }
-    *cs = compressor;
-    return 0;
-  }
-};
+#include "common/ceph_context.h"
+#include "CompressionPluginZlib.h"
 
 // -----------------------------------------------------------------------------
 

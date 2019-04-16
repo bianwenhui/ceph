@@ -1,25 +1,40 @@
-add_library(librados_objs OBJECT
+add_library(librados_impl STATIC
   IoCtxImpl.cc
   RadosXattrIter.cc
-  RadosClient.cc)
+  RadosClient.cc
+  librados_util.cc
+  librados_tp.cc)
+
+# C/C++ API
 add_library(librados ${CEPH_SHARED}
-  librados.cc
-  $<TARGET_OBJECTS:librados_objs>)
-add_dependencies(librados osdc)
-if(WITH_LTTNG)
-  add_dependencies(librados rados-tp)
-endif()
-# LINK_PRIVATE instead of PRIVATE is used to backward compatibility with cmake 2.8.11
-target_link_libraries(librados LINK_PRIVATE osdc common cls_lock_client
-  ${BLKID_LIBRARIES} ${CRYPTO_LIBS} ${EXTRALIBS})
+  librados_c.cc
+  librados_cxx.cc
+  $<TARGET_OBJECTS:common_buffer_obj>)
 if(ENABLE_SHARED)
   set_target_properties(librados PROPERTIES
     OUTPUT_NAME rados
     VERSION 2.0.0
     SOVERSION 2
-    # use COMPILE_FLAGS for the backward compatibility with cmake 2.8.11, should have been:
-    #  CXX_VISIBILITY_PRESET hidden
-    #  VISIBILITY_INLINES_HIDDEN ON
-    COMPILE_FLAGS "-fvisibility=hidden -fvisibility-inlines-hidden")
-endif(ENABLE_SHARED)
+    VISIBILITY_INLINES_HIDDEN ON)
+  if(NOT APPLE)
+    set_property(TARGET librados APPEND_STRING PROPERTY
+      LINK_FLAGS " -Wl,--exclude-libs,ALL")
+    set_property(TARGET librados APPEND_STRING PROPERTY
+      LINK_FLAGS " -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/librados.map")
+  endif()
+  if(WITH_STATIC_LIBSTDCXX)
+    set_property(TARGET librados APPEND_STRING PROPERTY
+      LINK_FLAGS " -static-libstdc++ -static-libgcc")
+  endif()
+endif()
+target_link_libraries(librados PRIVATE
+  librados_impl osdc ceph-common cls_lock_client
+  ${BLKID_LIBRARIES} ${CRYPTO_LIBS} ${EXTRALIBS} ${GSSAPI_LIBRARIES})
 install(TARGETS librados DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+if(WITH_LTTNG)
+  add_dependencies(librados_impl librados-tp)
+  if(WITH_EVENTTRACE)
+    add_dependencies(librados_impl eventtrace_tp)
+  endif()
+endif()

@@ -9,6 +9,7 @@
 #include <list>
 #include <string>
 #include <utility>
+#include "cls/rbd/cls_rbd_types.h"
 
 class Context;
 class RWLock;
@@ -25,8 +26,8 @@ public:
   ImageState(ImageCtxT *image_ctx);
   ~ImageState();
 
-  int open();
-  void open(Context *on_finish);
+  int open(uint64_t flags);
+  void open(uint64_t flags, Context *on_finish);
 
   int close();
   void close(Context *on_finish);
@@ -38,9 +39,11 @@ public:
   int refresh();
   int refresh_if_required();
   void refresh(Context *on_finish);
-  void acquire_lock_refresh(Context *on_finish);
 
-  void snap_set(const std::string &snap_name, Context *on_finish);
+  void snap_set(uint64_t snap_id, Context *on_finish);
+
+  void prepare_lock(Context *on_ready);
+  void handle_prepare_lock_complete();
 
   int register_update_watcher(UpdateWatchCtx *watcher, uint64_t *handle);
   int unregister_update_watcher(uint64_t handle);
@@ -55,21 +58,23 @@ private:
     STATE_OPENING,
     STATE_CLOSING,
     STATE_REFRESHING,
-    STATE_SETTING_SNAP
+    STATE_SETTING_SNAP,
+    STATE_PREPARING_LOCK
   };
 
   enum ActionType {
     ACTION_TYPE_OPEN,
     ACTION_TYPE_CLOSE,
     ACTION_TYPE_REFRESH,
-    ACTION_TYPE_SET_SNAP
+    ACTION_TYPE_SET_SNAP,
+    ACTION_TYPE_LOCK
   };
 
   struct Action {
     ActionType action_type;
     uint64_t refresh_seq = 0;
-    bool refresh_acquiring_lock = false;
-    std::string snap_name;
+    uint64_t snap_id = CEPH_NOSNAP;
+    Context *on_ready = nullptr;
 
     Action(ActionType action_type) : action_type(action_type) {
     }
@@ -79,10 +84,11 @@ private:
       }
       switch (action_type) {
       case ACTION_TYPE_REFRESH:
-        return (refresh_seq == action.refresh_seq &&
-                refresh_acquiring_lock == action.refresh_acquiring_lock);
+        return (refresh_seq == action.refresh_seq);
       case ACTION_TYPE_SET_SNAP:
-        return snap_name == action.snap_name;
+        return (snap_id == action.snap_id);
+      case ACTION_TYPE_LOCK:
+        return false;
       default:
         return true;
       }
@@ -104,10 +110,12 @@ private:
 
   ImageUpdateWatchers *m_update_watchers;
 
+  uint64_t m_open_flags;
+
   bool is_transition_state() const;
   bool is_closed() const;
 
-  void refresh(bool acquiring_lock, Context *on_finish);
+  const Action *find_pending_refresh() const;
 
   void append_context(const Action &action, Context *context);
   void execute_next_action_unlock();
@@ -125,6 +133,8 @@ private:
 
   void send_set_snap_unlock();
   void handle_set_snap(int r);
+
+  void send_prepare_lock_unlock();
 
 };
 

@@ -15,11 +15,10 @@
 #ifndef CEPH_LOGCLIENT_H
 #define CEPH_LOGCLIENT_H
 
+#include <atomic>
 #include "common/LogEntry.h"
-#include "common/Mutex.h"
-
-#include <iosfwd>
-#include <sstream>
+#include "common/ceph_mutex.h"
+#include "include/health.h"
 
 class LogClient;
 class MLog;
@@ -33,21 +32,21 @@ struct Connection;
 class LogChannel;
 
 namespace ceph {
-namespace log {
+namespace logging {
   class Graylog;
 }
 }
 
 int parse_log_client_options(CephContext *cct,
-			     map<string,string> &log_to_monitors,
-			     map<string,string> &log_to_syslog,
-			     map<string,string> &log_channels,
-			     map<string,string> &log_prios,
-			     map<string,string> &log_to_graylog,
-			     map<string,string> &log_to_graylog_host,
-			     map<string,string> &log_to_graylog_port,
+			     std::map<std::string,std::string> &log_to_monitors,
+			     std::map<std::string,std::string> &log_to_syslog,
+			     std::map<std::string,std::string> &log_channels,
+			     std::map<std::string,std::string> &log_prios,
+			     std::map<std::string,std::string> &log_to_graylog,
+			     std::map<std::string,std::string> &log_to_graylog_host,
+			     std::map<std::string,std::string> &log_to_graylog_port,
 			     uuid_d &fsid,
-			     string &host);
+			     std::string &host);
 
 class LogClientTemp
 {
@@ -65,7 +64,7 @@ public:
 private:
   clog_type type;
   LogChannel &parent;
-  stringstream ss;
+  std::stringstream ss;
 };
 
 /** Manage where we output to and at which priority
@@ -92,6 +91,23 @@ public:
   }
   void debug(std::stringstream &s) {
     do_log(CLOG_DEBUG, s);
+  }
+  /**
+   * Convenience function mapping health status to
+   * the appropriate cluster log severity.
+   */
+  LogClientTemp health(health_status_t health) {
+    switch(health) {
+      case HEALTH_OK:
+        return info();
+      case HEALTH_WARN:
+        return warn();
+      case HEALTH_ERR:
+        return error();
+      default:
+        // Invalid health_status_t value
+        ceph_abort();
+    }
   }
   LogClientTemp info() {
     return LogClientTemp(CLOG_INFO, *this);
@@ -153,22 +169,22 @@ public:
     return (graylog != nullptr);
   }
 
-  typedef shared_ptr<LogChannel> Ref;
+  typedef std::shared_ptr<LogChannel> Ref;
 
   /**
-   * update config values from parsed k/v map for each config option
+   * update config values from parsed k/v std::map for each config option
    *
    * Pick out the relevant value based on our channel.
    */
-  void update_config(map<string,string> &log_to_monitors,
-		     map<string,string> &log_to_syslog,
-		     map<string,string> &log_channels,
-		     map<string,string> &log_prios,
-		     map<string,string> &log_to_graylog,
-		     map<string,string> &log_to_graylog_host,
-		     map<string,string> &log_to_graylog_port,
+  void update_config(std::map<std::string,std::string> &log_to_monitors,
+		     std::map<std::string,std::string> &log_to_syslog,
+		     std::map<std::string,std::string> &log_channels,
+		     std::map<std::string,std::string> &log_prios,
+		     std::map<std::string,std::string> &log_to_graylog,
+		     std::map<std::string,std::string> &log_to_graylog_host,
+		     std::map<std::string,std::string> &log_to_graylog_port,
 		     uuid_d &fsid,
-		     string &host);
+		     std::string &host);
 
   void do_log(clog_type prio, std::stringstream& ss);
   void do_log(clog_type prio, const std::string& s);
@@ -176,13 +192,13 @@ public:
 private:
   CephContext *cct;
   LogClient *parent;
-  Mutex channel_lock;
+  ceph::mutex channel_lock = ceph::make_mutex("LogChannel::channel_lock");
   std::string log_channel;
   std::string log_prio;
   std::string syslog_facility;
   bool log_to_syslog;
   bool log_to_monitors;
-  shared_ptr<ceph::log::Graylog> graylog;
+  std::shared_ptr<ceph::logging::Graylog> graylog;
 
 
   friend class LogClientTemp;
@@ -205,8 +221,7 @@ public:
   }
 
   bool handle_log_ack(MLogAck *m);
-  void reset_session();
-  Message *get_mon_log_message();
+  Message *get_mon_log_message(bool flush);
   bool are_pending();
 
   LogChannelRef create_channel() {
@@ -218,7 +233,7 @@ public:
     if (channels.count(name))
       c = channels[name];
     else {
-      c = LogChannelRef(new LogChannel(cct, this, name));
+      c = std::make_shared<LogChannel>(cct, this, name);
       channels[name] = c;
     }
     return c;
@@ -233,6 +248,10 @@ public:
     channels.clear();
   }
 
+  uint64_t get_next_seq();
+  entity_addrvec_t get_myaddrs();
+  const EntityName& get_myname();
+  entity_name_t get_myrank();
   version_t queue(LogEntry &entry);
 
 private:
@@ -243,7 +262,7 @@ private:
   Messenger *messenger;
   MonMap *monmap;
   bool is_mon;
-  Mutex log_lock;
+  ceph::mutex log_lock = ceph::make_mutex("LogClient::log_lock");
   version_t last_log_sent;
   version_t last_log;
   std::deque<LogEntry> log_queue;

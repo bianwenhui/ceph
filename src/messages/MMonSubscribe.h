@@ -29,36 +29,39 @@ struct ceph_mon_subscribe_item_old {
 WRITE_RAW_ENCODER(ceph_mon_subscribe_item_old)
 
 
-struct MMonSubscribe : public Message {
+class MMonSubscribe : public MessageInstance<MMonSubscribe> {
+public:
+  friend factory;
 
-  static const int HEAD_VERSION = 2;
+  static constexpr int HEAD_VERSION = 3;
+  static constexpr int COMPAT_VERSION = 1;
 
-  map<string, ceph_mon_subscribe_item> what;
-  
-  MMonSubscribe() : Message(CEPH_MSG_MON_SUBSCRIBE, HEAD_VERSION) { }
+  std::string hostname;
+  std::map<std::string, ceph_mon_subscribe_item> what;
+
+  MMonSubscribe() : MessageInstance(CEPH_MSG_MON_SUBSCRIBE, HEAD_VERSION, COMPAT_VERSION) { }
 private:
-  ~MMonSubscribe() {}
+  ~MMonSubscribe() override {}
 
-public:  
+public:
   void sub_want(const char *w, version_t start, unsigned flags) {
     what[w].start = start;
     what[w].flags = flags;
   }
 
-  const char *get_type_name() const { return "mon_subscribe"; }
-  void print(ostream& o) const {
+  std::string_view get_type_name() const override { return "mon_subscribe"; }
+  void print(std::ostream& o) const override {
     o << "mon_subscribe(" << what << ")";
   }
 
-  void decode_payload() {
-    bufferlist::iterator p = payload.begin();
+  void decode_payload() override {
+    using ceph::decode;
+    auto p = payload.cbegin();
     if (header.version < 2) {
-      map<string, ceph_mon_subscribe_item_old> oldwhat;
-      ::decode(oldwhat, p);
+      std::map<std::string, ceph_mon_subscribe_item_old> oldwhat;
+      decode(oldwhat, p);
       what.clear();
-      for (map<string, ceph_mon_subscribe_item_old>::iterator q = oldwhat.begin();
-	   q != oldwhat.end();
-	   q++) {
+      for (auto q = oldwhat.begin(); q != oldwhat.end(); q++) {
 	if (q->second.have)
 	  what[q->first].start = q->second.have + 1;
 	else
@@ -67,20 +70,19 @@ public:
 	if (q->second.onetime)
 	  what[q->first].flags |= CEPH_SUBSCRIBE_ONETIME;
       }
-    } else {
-      ::decode(what, p);
+      return;
+    }
+    decode(what, p);
+    if (header.version >= 3) {
+      decode(hostname, p);
     }
   }
-  void encode_payload(uint64_t features) {
-    if (features & CEPH_FEATURE_SUBSCRIBE2) {
-      ::encode(what, payload);
-      header.version = HEAD_VERSION;
-    } else {
+  void encode_payload(uint64_t features) override {
+    using ceph::encode;
+    if ((features & CEPH_FEATURE_SUBSCRIBE2) == 0) {
       header.version = 0;
-      map<string, ceph_mon_subscribe_item_old> oldwhat;
-      for (map<string, ceph_mon_subscribe_item>::iterator q = what.begin();
-	   q != what.end();
-	   q++) {
+      std::map<std::string, ceph_mon_subscribe_item_old> oldwhat;
+      for (auto q = what.begin(); q != what.end(); q++) {
 	if (q->second.start)
 	  // warning: start=1 -> have=0, which was ambiguous
 	  oldwhat[q->first].have = q->second.start - 1;
@@ -88,8 +90,12 @@ public:
 	  oldwhat[q->first].have = 0;
 	oldwhat[q->first].onetime = q->second.flags & CEPH_SUBSCRIBE_ONETIME;
       }
-      ::encode(oldwhat, payload);
+      encode(oldwhat, payload);
+      return;
     }
+    header.version = HEAD_VERSION;
+    encode(what, payload);
+    encode(hostname, payload);
   }
 };
 

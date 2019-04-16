@@ -1,8 +1,8 @@
 #ifndef CEPH_CLS_VERSION_CLIENT_H
 #define CEPH_CLS_VERSION_CLIENT_H
 
-#include "include/types.h"
-#include "include/rados/librados.hpp"
+#include "include/rados/librados_fwd.hpp"
+#include "cls_version_ops.h"
 
 /*
  * version objclass

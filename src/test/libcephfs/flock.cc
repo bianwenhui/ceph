@@ -37,6 +37,8 @@
 #include <limits.h>
 #endif
 
+#include "include/ceph_assert.h"
+
 // Startup common: create and mount ceph fs
 #define STARTUP_CEPH() do {				\
     ASSERT_EQ(0, ceph_create(&cmount, NULL));		\
@@ -61,7 +63,7 @@ static const long waitSlowMs = 5000;
 // Get the absolute struct timespec reference from now + 'ms' milliseconds
 static const struct timespec* abstime(struct timespec &ts, long ms) {
   if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
-    abort();
+    ceph_abort();
   }
   ts.tv_nsec += ms * 1000000;
   ts.tv_sec += ts.tv_nsec / 1000000000;
@@ -70,7 +72,6 @@ static const struct timespec* abstime(struct timespec &ts, long ms) {
 }
 
 /* Basic locking */
-
 TEST(LibCephFS, BasicLocking) {
   struct ceph_mount_info *cmount = NULL;
   STARTUP_CEPH();
@@ -427,7 +428,8 @@ static void process_ConcurrentLocking(str_ConcurrentLocking& s) {
   exit(EXIT_SUCCESS);
 }
 
-TEST(LibCephFS, InterProcessLocking) {
+// Disabled because of fork() issues (http://tracker.ceph.com/issues/16556)
+TEST(LibCephFS, DISABLED_InterProcessLocking) {
   PROCESS_SLOW_MS();
   // Process synchronization
   char c_file[1024];
@@ -526,7 +528,8 @@ TEST(LibCephFS, InterProcessLocking) {
   CLEANUP_CEPH();
 }
 
-TEST(LibCephFS, ThreesomeInterProcessLocking) {
+// Disabled because of fork() issues (http://tracker.ceph.com/issues/16556)
+TEST(LibCephFS, DISABLED_ThreesomeInterProcessLocking) {
   PROCESS_SLOW_MS();
   // Process synchronization
   char c_file[1024];

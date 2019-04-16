@@ -1,12 +1,18 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-#include "journal/Journaler.h"
 #include "include/stringify.h"
-#include "gtest/gtest.h"
+
+#include "journal/Journaler.h"
+#include "journal/Settings.h"
+
 #include "test/librados/test.h"
 #include "test/journal/RadosTestFixture.h"
-#include "include/stringify.h"
+
+#include "gtest/gtest.h"
+
+// reinclude our assert to clobber the system one
+#include "include/ceph_assert.h"
 
 class TestJournaler : public RadosTestFixture {
 public:
@@ -17,20 +23,22 @@ public:
     return stringify(++_journal_id);
   }
 
-  virtual void SetUp() {
+  void SetUp() override {
     RadosTestFixture::SetUp();
     m_journal_id = get_temp_journal_id();
     m_journaler = new journal::Journaler(m_work_queue, m_timer, &m_timer_lock,
-                                         m_ioctx, m_journal_id, CLIENT_ID, 5);
+                                         m_ioctx, m_journal_id, CLIENT_ID, {});
   }
 
-  virtual void TearDown() {
+  void TearDown() override {
     delete m_journaler;
     RadosTestFixture::TearDown();
   }
 
   int create_journal(uint8_t order, uint8_t splay_width) {
-    return m_journaler->create(order, splay_width, -1);
+    C_SaferCond cond;
+    m_journaler->create(order, splay_width, -1, &cond);
+    return cond.wait();
   }
 
   int init_journaler() {
@@ -47,7 +55,7 @@ public:
 
   int register_client(const std::string &client_id, const std::string &desc) {
     journal::Journaler journaler(m_work_queue, m_timer, &m_timer_lock,
-                                 m_ioctx, m_journal_id, client_id, 5);
+                                 m_ioctx, m_journal_id, client_id, {});
     bufferlist data;
     data.append(desc);
     C_SaferCond cond;
@@ -57,7 +65,7 @@ public:
 
   int update_client(const std::string &client_id, const std::string &desc) {
     journal::Journaler journaler(m_work_queue, m_timer, &m_timer_lock,
-                                 m_ioctx, m_journal_id, client_id, 5);
+                                 m_ioctx, m_journal_id, client_id, {});
     bufferlist data;
     data.append(desc);
     C_SaferCond cond;
@@ -67,7 +75,7 @@ public:
 
   int unregister_client(const std::string &client_id) {
     journal::Journaler journaler(m_work_queue, m_timer, &m_timer_lock,
-                                 m_ioctx, m_journal_id, client_id, 5);
+                                 m_ioctx, m_journal_id, client_id, {});
     C_SaferCond cond;
     journaler.unregister_client(&cond);
     return cond.wait();

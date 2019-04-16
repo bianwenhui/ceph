@@ -46,17 +46,19 @@ Options
 =======
 
 :command:`wsize`
-  int, max write size. Default: none (writeback uses smaller of wsize
+  int (bytes), max write size. Default: 16777216 (16*1024*1024) (writeback uses smaller of wsize
   and stripe unit)
 
 :command:`rsize`
-  int (bytes), max readahead, multiple of 1024, Default: 524288
-  (512*1024)
+  int (bytes), max read size. Default: 16777216 (16*1024*1024)
+
+:command:`rasize`
+  int (bytes), max readahead. Default: 8388608 (8192*1024)
 
 :command:`osdtimeout`
   int (seconds), Default: 60
 
-:command:`osdkeepalivetimeout`
+:command:`osdkeepalive`
   int, Default: 5
 
 :command:`mount_timeout`
@@ -112,7 +114,7 @@ Options
 
 :command:`rbytes`
   Report the recursive size of the directory contents for st_size on
-  directories.  Default: on
+  directories.  Default: off
 
 :command:`norbytes`
   Do not report the recursive size of the directory contents for

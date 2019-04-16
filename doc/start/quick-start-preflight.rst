@@ -2,30 +2,23 @@
  Preflight Checklist
 =====================
 
-.. versionadded:: 0.60
-
-Thank you for trying Ceph! We recommend setting up a ``ceph-deploy`` admin
-:term:`node` and a 3-node :term:`Ceph Storage Cluster` to explore the basics of
-Ceph. This **Preflight Checklist** will help you prepare a ``ceph-deploy``
-admin node and three Ceph Nodes (or virtual machines) that will host your Ceph
-Storage Cluster. Before proceeding any further, see `OS Recommendations`_ to
-verify that you have a supported distribution and version of Linux. When
-you use a single Linux distribution and version across the cluster, it will
-make it easier for you to troubleshoot issues that arise in production.
+The ``ceph-deploy`` tool operates out of a directory on an admin
+:term:`node`.  Any host with network connectivity and a modern python
+environment and ssh (such as Linux) should work.
 
 In the descriptions below, :term:`Node` refers to a single machine.
 
 .. include:: quick-common.rst
 
 
-Ceph Deploy Setup
+Ceph-deploy Setup
 =================
 
 Add Ceph repositories to the ``ceph-deploy`` admin node. Then, install
 ``ceph-deploy``.
 
-Advanced Package Tool (APT)
----------------------------
+Debian/Ubuntu
+-------------
 
 For Debian and Ubuntu distributions, perform the following steps:
 
@@ -33,70 +26,86 @@ For Debian and Ubuntu distributions, perform the following steps:
 
 	wget -q -O- 'https://download.ceph.com/keys/release.asc' | sudo apt-key add -
 
-#. Add the Ceph packages to your repository. Replace ``{ceph-stable-release}``
-   with a stable Ceph release (e.g., ``hammer``, ``jewel``, etc.)
-   For example::
+#. Add the Ceph packages to your repository. Use the command below and
+   replace ``{ceph-stable-release}`` with a stable Ceph release (e.g.,
+   ``luminous``.)  For example::
 
-	echo deb http://download.ceph.com/debian-{ceph-stable-release}/ $(lsb_release -sc) main | sudo tee /etc/apt/sources.list.d/ceph.list
+	echo deb https://download.ceph.com/debian-{ceph-stable-release}/ $(lsb_release -sc) main | sudo tee /etc/apt/sources.list.d/ceph.list
 
 #. Update your repository and install ``ceph-deploy``::
 
-	sudo apt-get update && sudo apt-get install ceph-deploy
+	sudo apt update
+	sudo apt install ceph-deploy
 
-.. note:: You can also use the EU mirror eu.ceph.com for downloading your packages.
-   Simply replace ``http://ceph.com/`` by ``http://eu.ceph.com/``
+.. note:: You can also use the EU mirror eu.ceph.com for downloading your packages by replacing ``https://ceph.com/`` by ``http://eu.ceph.com/``
 
 
-Red Hat Package Manager (RPM)
------------------------------
+RHEL/CentOS
+-----------
 
 For CentOS 7, perform the following steps:
 
-#. On Red Hat Enterprise Linux 7, register the target machine with ``subscription-manager``, verify your subscriptions, and enable the "Extras" repoistory for package dependencies. For example::
+#. On Red Hat Enterprise Linux 7, register the target machine with
+   ``subscription-manager``, verify your subscriptions, and enable the
+   "Extras" repository for package dependencies. For example::
 
         sudo subscription-manager repos --enable=rhel-7-server-extras-rpms
 
 #. Install and enable the Extra Packages for Enterprise Linux (EPEL)
-   repository. Please see the `EPEL wiki`_ page for more information.
+   repository::
 
-#. On CentOS, you can execute the following command chain::
+        sudo yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
 
-        sudo yum install -y yum-utils && sudo yum-config-manager --add-repo https://dl.fedoraproject.org/pub/epel/7/x86_64/ && sudo yum install --nogpgcheck -y epel-release && sudo rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-7 && sudo rm /etc/yum.repos.d/dl.fedoraproject.org*
+   Please see the `EPEL wiki`_ page for more information.
 
-#. Add the package to your repository. Open a text editor and create a
-   Yellowdog Updater, Modified (YUM) entry. Use the file path
-   ``/etc/yum.repos.d/ceph.repo``. For example::
+#. Add the Ceph repository to your yum configuration file at ``/etc/yum.repos.d/ceph.repo`` with the following command. Replace  ``{ceph-stable-release}`` with a stable Ceph release (e.g.,
+   ``luminous``.)  For example::
 
-	sudo vim /etc/yum.repos.d/ceph.repo
-
-   Paste the following example code. Replace ``{ceph-release}`` with
-   the recent major release of Ceph (e.g., ``jewel``). Replace ``{distro}``
-   with your Linux distribution (e.g., ``el7`` for CentOS 7). Finally, save the
-   contents to the
-   ``/etc/yum.repos.d/ceph.repo`` file. ::
-
-	[ceph-noarch]
-	name=Ceph noarch packages
-	baseurl=http://download.ceph.com/rpm-{ceph-release}/{distro}/noarch
-	enabled=1
-	gpgcheck=1
-	type=rpm-md
-	gpgkey=https://download.ceph.com/keys/release.asc
-
+     cat << EOM > /etc/yum.repos.d/ceph.repo
+     [ceph-noarch]
+     name=Ceph noarch packages
+     baseurl=https://download.ceph.com/rpm-{ceph-stable-release}/el7/noarch
+     enabled=1
+     gpgcheck=1
+     type=rpm-md
+     gpgkey=https://download.ceph.com/keys/release.asc
+     EOM
 
 #. Update your repository and install ``ceph-deploy``::
 
-	sudo yum update && sudo yum install ceph-deploy
+	sudo yum update
+	sudo yum install ceph-deploy
+
+.. note:: You can also use the EU mirror eu.ceph.com for downloading your packages by replacing ``https://ceph.com/`` by ``http://eu.ceph.com/``
 
 
-.. note:: You can also use the EU mirror eu.ceph.com for downloading your packages.
-   Simply replace ``http://ceph.com/`` by ``http://eu.ceph.com/``
+openSUSE
+--------
+
+The Ceph project does not currently publish release RPMs for openSUSE, but 
+a stable version of Ceph is included in the default update repository, so
+installing it is just a matter of::
+
+	sudo zypper install ceph
+	sudo zypper install ceph-deploy
+
+If the distro version is out-of-date, open a bug at
+https://bugzilla.opensuse.org/index.cgi and possibly try your luck with one of
+the following repositories:
+
+#. Hammer::
+
+        https://software.opensuse.org/download.html?project=filesystems%3Aceph%3Ahammer&package=ceph
+
+#. Jewel::
+
+        https://software.opensuse.org/download.html?project=filesystems%3Aceph%3Ajewel&package=ceph
 
 
 Ceph Node Setup
 ===============
 
-The admin node must be have password-less SSH access to Ceph nodes.
+The admin node must have password-less SSH access to Ceph nodes.
 When ceph-deploy logs in to a Ceph node as a user, that particular
 user must have passwordless ``sudo`` privileges.
 
@@ -113,7 +122,7 @@ On CentOS / RHEL, execute::
 
 On Debian / Ubuntu, execute::
 
-	sudo apt-get install ntp
+	sudo apt install ntp
 
 Ensure that you enable the NTP service. Ensure that each Ceph Node uses the
 same NTP time server. See `NTP`_ for details.
@@ -126,7 +135,7 @@ For **ALL** Ceph Nodes perform the following steps:
 
 #. Install an SSH server (if necessary) on each Ceph Node::
 
-	sudo apt-get install openssh-server
+	sudo apt install openssh-server
 
    or::
 
@@ -157,7 +166,7 @@ hacks (e.g., ``root``,  ``admin``, ``{productname}``). The following procedure,
 substituting  ``{username}`` for the user name you define, describes how to
 create a user with passwordless ``sudo``.
 
-.. note:: Starting with the `Infernalis release`_ the "ceph" user name is reserved
+.. note:: Starting with the :ref:`Infernalis release <infernalis-release-notes>`, the "ceph" user name is reserved
    for the Ceph daemons. If the "ceph" user already exists on the Ceph nodes,
    removing the user must be done before attempting an upgrade.
 
@@ -260,11 +269,21 @@ On some distributions (e.g., RHEL), the default firewall configuration is fairly
 strict. You may need to adjust your firewall settings allow inbound requests so
 that clients in your network can communicate with daemons on your Ceph nodes.
 
-For ``firewalld`` on RHEL 7, add port ``6789`` for Ceph Monitor nodes and ports
-``6800:7300`` for Ceph OSDs to the public zone and ensure that you make the
-setting permanent so that it is enabled on reboot. For example::
+For ``firewalld`` on RHEL 7, add the ``ceph-mon`` service for Ceph Monitor
+nodes and the ``ceph`` service for Ceph OSDs and MDSs to the public zone and
+ensure that you make the settings permanent so that they are enabled on reboot.
 
-	sudo firewall-cmd --zone=public --add-port=6789/tcp --permanent
+For example, on monitors::
+
+	sudo firewall-cmd --zone=public --add-service=ceph-mon --permanent
+
+and on OSDs and MDSs::
+
+	sudo firewall-cmd --zone=public --add-service=ceph --permanent
+
+Once you have finished configuring firewalld with the ``--permanent`` flag, you can make the changes live immediately without rebooting::
+
+	sudo firewall-cmd --reload
 
 For ``iptables``, add port ``6789`` for Ceph Monitors and ports ``6800:7300``
 for Ceph OSDs. For example::
