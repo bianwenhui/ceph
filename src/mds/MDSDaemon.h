@@ -146,11 +146,12 @@ class MDSDaemon : public Dispatcher, public md_config_obs_t {
   bool ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer, bool force_new);
   bool ms_verify_authorizer(Connection *con, int peer_type,
 			       int protocol, bufferlist& authorizer_data, bufferlist& authorizer_reply,
-			       bool& isvalid, CryptoKey& session_key);
-  void ms_handle_accept(Connection *con);
-  void ms_handle_connect(Connection *con);
-  bool ms_handle_reset(Connection *con);
-  void ms_handle_remote_reset(Connection *con);
+			    bool& isvalid, CryptoKey& session_key,
+			    std::unique_ptr<AuthAuthorizerChallenge> *challenge) override;
+  void ms_handle_accept(Connection *con) override;
+  void ms_handle_connect(Connection *con) override;
+  bool ms_handle_reset(Connection *con) override;
+  void ms_handle_remote_reset(Connection *con) override;
 
  protected:
   // admin socket handling
@@ -187,13 +188,17 @@ protected:
   bool handle_core_message(Message *m);
   
   // special message types
+  friend class C_MDS_Send_Command_Reply;
+  static void send_command_reply(MCommand *m, MDSRank* mds_rank, int r,
+				 bufferlist outbl, const std::string& outs);
   int _handle_command_legacy(std::vector<std::string> args);
   int _handle_command(
       const cmdmap_t &cmdmap,
-      bufferlist const &inbl,
+      MCommand *m,
       bufferlist *outbl,
       std::string *outs,
-      Context **run_later);
+      Context **run_later,
+      bool *need_reply);
   void handle_command(class MMonCommand *m);
   void handle_command(class MCommand *m);
   void handle_mds_map(class MMDSMap *m);

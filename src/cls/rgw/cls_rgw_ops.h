@@ -443,6 +443,30 @@ struct rgw_cls_check_index_ret
 };
 WRITE_CLASS_ENCODER(rgw_cls_check_index_ret)
 
+struct rgw_cls_bucket_update_stats_op
+{
+  bool absolute{false};
+  map<uint8_t, rgw_bucket_category_stats> stats;
+
+  rgw_cls_bucket_update_stats_op() {}
+
+  void encode(bufferlist &bl) const {
+    ENCODE_START(1, 1, bl);
+    ::encode(absolute, bl);
+    ::encode(stats, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(bufferlist::iterator &bl) {
+    DECODE_START(1, bl);
+    ::decode(absolute, bl);
+    ::decode(stats, bl);
+    DECODE_FINISH(bl);
+  }
+  void dump(Formatter *f) const;
+  static void generate_test_instances(list<rgw_cls_bucket_update_stats_op *>& o);
+};
+WRITE_CLASS_ENCODER(rgw_cls_bucket_update_stats_op)
+
 struct rgw_cls_obj_remove_op {
   list<string> keep_attr_prefixes;
 
@@ -817,20 +841,24 @@ WRITE_CLASS_ENCODER(cls_rgw_gc_list_op)
 
 struct cls_rgw_gc_list_ret {
   list<cls_rgw_gc_obj_info> entries;
+  string next_marker;
   bool truncated;
 
   cls_rgw_gc_list_ret() : truncated(false) {}
 
   void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     ::encode(entries, bl);
+    ::encode(next_marker, bl);
     ::encode(truncated, bl);
     ENCODE_FINISH(bl);
   }
 
   void decode(bufferlist::iterator& bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     ::decode(entries, bl);
+    if (struct_v >= 2)
+      ::decode(next_marker, bl);
     ::decode(truncated, bl);
     DECODE_FINISH(bl);
   }
@@ -937,5 +965,4 @@ struct cls_rgw_bi_log_list_ret {
 };
 WRITE_CLASS_ENCODER(cls_rgw_bi_log_list_ret)
 
-
-#endif
+#endif /* CEPH_CLS_RGW_OPS_H */

@@ -218,7 +218,7 @@ function test_kill_daemon() {
         # kill the mon and verify it cannot be reached
         #
         kill_daemon $pidfile TERM || return 1
-        ! ceph --connect-timeout 60 status || return 1
+        ! timeout 60 ceph --connect-timeout 60 status || return 1
     done
 
     teardown $dir || return 1
@@ -294,7 +294,7 @@ function test_kill_daemons() {
     # kill the mon and verify it cannot be reached
     #
     kill_daemons $dir TERM || return 1
-    ! ceph --connect-timeout 60 status || return 1
+    ! timeout 60 ceph --connect-timeout 60 status || return 1
     teardown $dir || return 1
 }
 
@@ -897,6 +897,8 @@ function test_get_not_primary() {
 # @param STDOUT the output of ceph-objectstore-tool
 # @return 0 on success, 1 on error
 #
+# The value of $ceph_osd_args will be passed to restarted osds
+#
 function objectstore_tool() {
     local dir=$1
     shift
@@ -909,7 +911,7 @@ function objectstore_tool() {
         --data-path $osd_data \
         --journal-path $osd_data/journal \
         "$@" || return 1
-    activate_osd $dir $id >&2 || return 1
+    activate_osd $dir $id $ceph_osd_args >&2 || return 1
     wait_for_clean >&2
 }
 
@@ -1031,8 +1033,9 @@ function test_get_num_pgs() {
 #
 function get_last_scrub_stamp() {
     local pgid=$1
+    local sname=${2:-last_scrub_stamp}
     ceph --format xml pg dump pgs 2>/dev/null | \
-        $XMLSTARLET sel -t -m "//pg_stat[pgid='$pgid']/last_scrub_stamp" -v .
+        $XMLSTARLET sel -t -m "//pg_stat[pgid='$pgid']/$sname" -v .
 }
 
 function test_get_last_scrub_stamp() {
@@ -1171,6 +1174,13 @@ function pg_scrub() {
     wait_for_scrub $pgid "$last_scrub"
 }
 
+function pg_deep_scrub() {
+    local pgid=$1
+    local last_scrub=$(get_last_scrub_stamp $pgid last_deep_scrub_stamp)
+    ceph pg deep-scrub $pgid
+    wait_for_scrub $pgid "$last_scrub" last_deep_scrub_stamp
+}
+
 function test_pg_scrub() {
     local dir=$1
 
@@ -1250,9 +1260,10 @@ function test_expect_failure() {
 function wait_for_scrub() {
     local pgid=$1
     local last_scrub="$2"
+    local sname=${3:-last_scrub_stamp}
 
     for ((i=0; i < $TIMEOUT; i++)); do
-        if test "$last_scrub" != "$(get_last_scrub_stamp $pgid)" ; then
+        if test "$last_scrub" != "$(get_last_scrub_stamp $pgid $sname)" ; then
             return 0
         fi
         sleep 1
@@ -1442,7 +1453,7 @@ function test_wait_background() {
 # @return 0 on success, 1 on error
 #
 function main() {
-    local dir=testdir/$1
+    local dir=td/$1
     shift
 
     shopt -s -o xtrace
@@ -1481,7 +1492,7 @@ function run_tests() {
     export CEPH_CONF=/dev/null
 
     local funcs=${@:-$(set | sed -n -e 's/^\(test_[0-9a-z_]*\) .*/\1/p')}
-    local dir=testdir/ceph-helpers
+    local dir=td/ceph-helpers
 
     for func in $funcs ; do
         $func $dir || return 1
@@ -1492,6 +1503,37 @@ if test "$1" = TESTS ; then
     shift
     run_tests "$@"
 fi
+
+function inject_eio() {
+    local pooltype=$1
+    shift
+    local which=$1
+    shift
+    local poolname=$1
+    shift
+    local objname=$1
+    shift
+    local dir=$1
+    shift
+    local shard_id=$1
+    shift
+
+    local -a initial_osds=($(get_osds $poolname $objname))
+    local osd_id=${initial_osds[$shard_id]}
+    if [ "$pooltype" != "ec" ]; then
+        shard_id=""
+    fi
+    set_config osd $osd_id filestore_debug_inject_read_err true || return 1
+    local loop=0
+    while ( CEPH_ARGS='' ceph --admin-daemon $dir/ceph-osd.$osd_id.asok \
+             inject${which}err $poolname $objname $shard_id | grep -q Invalid ); do
+        loop=$(expr $loop + 1)
+        if [ $loop = "10" ]; then
+            return 1
+        fi
+        sleep 1
+    done
+}
 
 # Local Variables:
 # compile-command: "cd ../../src ; make -j4 && ../qa/workunits/ceph-helpers.sh TESTS # test_get_config"

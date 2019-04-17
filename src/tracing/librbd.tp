@@ -1766,6 +1766,84 @@ TRACEPOINT_EVENT(librbd, is_exclusive_lock_owner_exit,
     )
 )
 
+TRACEPOINT_EVENT(librbd, lock_acquire_enter,
+    TP_ARGS(
+        void*, imagectx,
+        int, lock_mode),
+    TP_FIELDS(
+      ctf_integer_hex(void*, imagectx, imagectx)
+      ctf_integer(int, lock_mode, lock_mode)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, lock_acquire_exit,
+    TP_ARGS(
+        void*, imagectx,
+        int, retval),
+    TP_FIELDS(
+      ctf_integer_hex(void*, imagectx, imagectx)
+      ctf_integer(int, retval, retval)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, lock_release_enter,
+    TP_ARGS(
+        void*, imagectx),
+    TP_FIELDS(
+      ctf_integer_hex(void*, imagectx, imagectx)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, lock_release_exit,
+    TP_ARGS(
+        void*, imagectx,
+        int, retval),
+    TP_FIELDS(
+      ctf_integer_hex(void*, imagectx, imagectx)
+      ctf_integer(int, retval, retval)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, lock_get_owners_enter,
+    TP_ARGS(
+        void*, imagectx),
+    TP_FIELDS(
+        ctf_integer_hex(void*, imagectx, imagectx)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, lock_get_owners_exit,
+    TP_ARGS(
+        void*, imagectx,
+        int, retval),
+    TP_FIELDS(
+        ctf_integer_hex(void*, imagectx, imagectx)
+        ctf_integer(int, retval, retval)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, lock_break_enter,
+    TP_ARGS(
+        void*, imagectx,
+        int, lock_mode,
+	const char*, lock_owner),
+    TP_FIELDS(
+        ctf_integer_hex(void*, imagectx, imagectx)
+        ctf_integer(int, lock_mode, lock_mode)
+        ctf_string(lock_owner, lock_owner)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, lock_break_exit,
+    TP_ARGS(
+        void*, imagectx,
+        int, retval),
+    TP_FIELDS(
+        ctf_integer_hex(void*, imagectx, imagectx)
+        ctf_integer(int, retval, retval)
+    )
+)
+
 TRACEPOINT_EVENT(librbd, stat_enter,
     TP_ARGS(
         void*, imagectx,
@@ -1793,5 +1871,43 @@ TRACEPOINT_EVENT(librbd, stat_exit,
         ctf_array_text(char, block_name_prefix, info->block_name_prefix, RBD_MAX_BLOCK_NAME_SIZE)
         ctf_integer(int64_t, parent_pool, info->parent_pool)
         ctf_array_text(char, parent_name, info->parent_name, RBD_MAX_IMAGE_NAME_SIZE)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, update_watch_enter,
+    TP_ARGS(
+        void*, imagectx,
+        void*, watchctx),
+    TP_FIELDS(
+        ctf_integer_hex(void*, imagctx, imagectx)
+        ctf_integer_hex(void*, watchctx, watchctx)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, update_watch_exit,
+    TP_ARGS(
+        int, retval,
+        uint64_t, handle),
+    TP_FIELDS(
+        ctf_integer(int, retval, retval)
+        ctf_integer(uint64_t, handle, handle)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, update_unwatch_enter,
+    TP_ARGS(
+        void*, imagectx,
+        uint64_t, handle),
+    TP_FIELDS(
+        ctf_integer_hex(void*, imagctx, imagectx)
+        ctf_integer(uint64_t, handle, handle)
+    )
+)
+
+TRACEPOINT_EVENT(librbd, update_unwatch_exit,
+    TP_ARGS(
+        int, retval),
+    TP_FIELDS(
+        ctf_integer(int, retval, retval)
     )
 )

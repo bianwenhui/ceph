@@ -11,8 +11,6 @@
 #include <errno.h>
 #include <signal.h>
 
-#include <curl/curl.h>
-
 #include <boost/intrusive_ptr.hpp>
 
 #include "acconfig.h"
@@ -54,6 +52,7 @@
 #include "rgw_request.h"
 #include "rgw_process.h"
 #include "rgw_frontend.h"
+#include "rgw_http_client_curl.h"
 
 #include <map>
 #include <string>
@@ -61,6 +60,10 @@
 
 #include "include/types.h"
 #include "common/BackTrace.h"
+
+#ifdef HAVE_SYS_PRCTL_H
+#include <sys/prctl.h>
+#endif
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -131,17 +134,6 @@ static void godown_alarm(int signum)
   _exit(0);
 }
 
-#ifdef HAVE_CURL_MULTI_WAIT
-static void check_curl()
-{
-}
-#else
-static void check_curl()
-{
-  derr << "WARNING: libcurl doesn't support curl_multi_wait()" << dendl;
-  derr << "WARNING: cross zone / region transfer performance may be affected" << dendl;
-}
-#endif
 
 class C_InitTimeout : public Context {
 public:
@@ -174,8 +166,6 @@ static RGWRESTMgr *set_logging(RGWRESTMgr *mgr)
   return mgr;
 }
 
-void intrusive_ptr_add_ref(CephContext* cct) { cct->get(); }
-void intrusive_ptr_release(CephContext* cct) { cct->put(); }
 
 /*
  * start up the RADOS connection and then handle HTTP messages as they come in
@@ -245,8 +235,10 @@ int main(int argc, const char **argv)
   // Now that we've determined which frontend(s) to use, continue with global
   // initialization. Passing false as the final argument ensures that
   // global_pre_init() is not invoked twice.
-  global_init(&def_args, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_DAEMON,
-	      flags, "rgw_data", false);
+  // claim the reference and release it after subsequent destructors have fired
+  auto cct = global_init(&def_args, args, CEPH_ENTITY_TYPE_CLIENT,
+			 CODE_ENVIRONMENT_DAEMON,
+			 flags, "rgw_data", false);
 
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ++i) {
     if (ceph_argparse_flag(args, i, "-h", "--help", (char*)NULL)) {
@@ -255,7 +247,19 @@ int main(int argc, const char **argv)
     }
   }
 
-  check_curl();
+  // maintain existing region root pool for new multisite objects
+  if (!g_conf->rgw_region_root_pool.empty()) {
+    const char *root_pool = g_conf->rgw_region_root_pool.c_str();
+    if (g_conf->rgw_zonegroup_root_pool.empty()) {
+      g_conf->set_val_or_die("rgw_zonegroup_root_pool", root_pool);
+    }
+    if (g_conf->rgw_period_root_pool.empty()) {
+      g_conf->set_val_or_die("rgw_period_root_pool", root_pool);
+    }
+    if (g_conf->rgw_realm_root_pool.empty()) {
+      g_conf->set_val_or_die("rgw_realm_root_pool", root_pool);
+    }
+  }
 
   if (g_conf->daemonize) {
     global_init_daemonize(g_ceph_context);
@@ -272,15 +276,12 @@ int main(int argc, const char **argv)
 
   common_init_finish(g_ceph_context);
 
-  // claim the reference and release it after subsequent destructors have fired
-  boost::intrusive_ptr<CephContext> cct(g_ceph_context, false);
-
   rgw_tools_init(g_ceph_context);
 
   rgw_init_resolver();
-  
-  curl_global_init(CURL_GLOBAL_ALL);
-  
+
+  rgw::curl::setup_curl(fe_map);
+
   FCGX_Init();
 
   int r = 0;
@@ -325,20 +326,54 @@ int main(int argc, const char **argv)
   }
 
   // S3 website mode is a specialization of S3
-  bool s3website_enabled = apis_map.count("s3website") > 0;
-  if (apis_map.count("s3") > 0 || s3website_enabled)
-    rest.register_default_mgr(set_logging(new RGWRESTMgr_S3(s3website_enabled)));
+  const bool s3website_enabled = apis_map.count("s3website") > 0;
+  // Swift API entrypoint could placed in the root instead of S3
+  const bool swift_at_root = g_conf->rgw_swift_url_prefix == "/";
+  if (apis_map.count("s3") > 0 || s3website_enabled) {
+    if (! swift_at_root) {
+      rest.register_default_mgr(set_logging(new RGWRESTMgr_S3(s3website_enabled)));
+    } else {
+      derr << "Cannot have the S3 or S3 Website enabled together with "
+           << "Swift API placed in the root of hierarchy" << dendl;
+      return EINVAL;
+    }
+  }
 
   if (apis_map.count("swift") > 0) {
     do_swift = true;
     swift_init(g_ceph_context);
-    rest.register_resource(g_conf->rgw_swift_url_prefix,
-			   set_logging(new RGWRESTMgr_SWIFT));
+
+    RGWRESTMgr_SWIFT* const swift_resource = new RGWRESTMgr_SWIFT;
+
+    if (! g_conf->rgw_cross_domain_policy.empty()) {
+      swift_resource->register_resource("crossdomain.xml",
+                          set_logging(new RGWRESTMgr_SWIFT_CrossDomain));
+    }
+
+    swift_resource->register_resource("healthcheck",
+                          set_logging(new RGWRESTMgr_SWIFT_HealthCheck));
+
+    swift_resource->register_resource("info",
+                          set_logging(new RGWRESTMgr_SWIFT_Info));
+
+    if (! swift_at_root) {
+      rest.register_resource(g_conf->rgw_swift_url_prefix,
+                          set_logging(swift_resource));
+    } else {
+      if (store->get_zonegroup().zones.size() > 1) {
+        derr << "Placing Swift API in the root of URL hierarchy while running"
+             << " multi-site configuration requires another instance of RadosGW"
+             << " with S3 API enabled!" << dendl;
+      }
+
+      rest.register_default_mgr(set_logging(swift_resource));
+    }
   }
 
-  if (apis_map.count("swift_auth") > 0)
+  if (apis_map.count("swift_auth") > 0) {
     rest.register_resource(g_conf->rgw_swift_auth_entry,
 			   set_logging(new RGWRESTMgr_SWIFT_Auth));
+  }
 
   if (apis_map.count("admin") > 0) {
     RGWRESTMgr_Admin *admin_resource = new RGWRESTMgr_Admin;
@@ -355,6 +390,9 @@ int main(int argc, const char **argv)
     admin_resource->register_resource("realm", new RGWRESTMgr_Realm);
     rest.register_resource(g_conf->rgw_admin_entry, admin_resource);
   }
+
+  /* Header custom behavior */
+  rest.register_x_headers(g_conf->rgw_log_http_headers);
 
   OpsLogSocket *olog = NULL;
 
@@ -388,10 +426,7 @@ int main(int argc, const char **argv)
 
       fe = new RGWFCGXFrontend(fcgi_pe, config);
     } else if (framework == "civetweb" || framework == "mongoose") {
-      int port;
-      config->get_val("port", 80, &port);
-
-      RGWProcessEnv env = { store, &rest, olog, port };
+      RGWProcessEnv env = { store, &rest, olog, 0 };
 
       fe = new RGWMongooseFrontend(env, config);
     } else if (framework == "loadgen") {
@@ -428,6 +463,12 @@ int main(int argc, const char **argv)
   RGWRealmWatcher realm_watcher(g_ceph_context, store->realm);
   realm_watcher.add_watcher(RGWRealmNotify::Reload, reloader);
   realm_watcher.add_watcher(RGWRealmNotify::ZonesNeedPeriod, pusher);
+
+#if defined(HAVE_SYS_PRCTL_H)
+  if (prctl(PR_SET_DUMPABLE, 1) == -1) {
+    cerr << "warning: unable to set dumpable flag: " << cpp_strerror(errno) << std::endl;
+  }
+#endif
 
   wait_shutdown();
 
@@ -470,7 +511,7 @@ int main(int argc, const char **argv)
 
   rgw_tools_cleanup();
   rgw_shutdown_resolver();
-  curl_global_cleanup();
+  rgw::curl::cleanup_curl();
 
   rgw_perf_stop(g_ceph_context);
 

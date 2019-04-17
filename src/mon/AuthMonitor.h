@@ -19,6 +19,7 @@
 #include <set>
 using namespace std;
 
+#include "global/global_init.h"
 #include "include/ceph_features.h"
 #include "include/types.h"
 #include "msg/Messenger.h"
@@ -35,11 +36,11 @@ class KeyRing;
 #define MIN_GLOBAL_ID 0x1000
 
 class AuthMonitor : public PaxosService {
+public:
   enum IncType {
     GLOBAL_ID,
     AUTH_DATA,
   };
-public:
   struct Incremental {
     IncType inc_type;
     uint64_t max_global_id;
@@ -114,7 +115,7 @@ private:
   void upgrade_format();
 
   void export_keyring(KeyRing& keyring);
-  void import_keyring(KeyRing& keyring);
+  int import_keyring(KeyRing& keyring);
 
   void push_cephx_inc(KeyServerData::Incremental& auth_inc) {
     Incremental inc;
@@ -124,19 +125,9 @@ private:
     pending_auth.push_back(inc);
   }
 
-  /* validate mon caps ; don't care about caps for other services as
+  /* validate mon/osd/mds caps ; don't care about caps for other services as
    * we don't know how to validate them */
-  bool valid_caps(const vector<string>& caps, ostream *out) {
-    for (vector<string>::const_iterator p = caps.begin();
-         p != caps.end(); p += 2) {
-      if (!p->empty() && *p != "mon")
-        continue;
-      MonCap tmp;
-      if (!tmp.parse(*(p+1), out))
-        return false;
-    }
-    return true;
-  }
+  bool valid_caps(const vector<string>& caps, ostream *out);
 
   void on_active();
   bool should_propose(double& delay);

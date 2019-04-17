@@ -34,7 +34,7 @@ Build-Depends: autoconf,
 	       libboost-regex-dev,
 	       libboost-random-dev,
                libboost-iostreams-dev (>= 1.42),
-               libcurl4-gnutls-dev,
+               libcurl4-openssl-dev,
                libexpat1-dev,
                libfcgi-dev,
                libfuse-dev,
@@ -89,12 +89,11 @@ Depends: binutils,
          gdisk,
          grep,
          logrotate,
-         lsb-release,
-         parted,
          python,
          python-argparse | libpython2.7-stdlib,
          python-pkg-resources,
          sdparm | hdparm,
+         psmisc,
          xfsprogs,
          ${misc:Depends},
          ${shlibs:Depends}
@@ -179,7 +178,10 @@ Description: debugging symbols for ceph-mon
 
 Package: ceph-osd
 Architecture: linux-any
-Depends: ceph-base (= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends}
+Depends: ceph-base (= ${binary:Version}),
+         parted,
+         ${misc:Depends},
+         ${shlibs:Depends}
 Recommends: ceph-common (= ${binary:Version})
 Replaces: ceph (<< 10)
 Breaks: ceph (<< 10)

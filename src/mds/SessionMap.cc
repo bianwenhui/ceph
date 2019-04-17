@@ -52,7 +52,7 @@ void SessionMap::dump()
 	     << " state " << p->second->get_state_name()
 	     << " completed " << p->second->info.completed_requests
 	     << " prealloc_inos " << p->second->info.prealloc_inos
-	     << " used_ions " << p->second->info.used_inos
+	     << " used_inos " << p->second->info.used_inos
 	     << dendl;
 }
 
@@ -771,11 +771,8 @@ void Session::notify_cap_release(size_t n_caps)
 {
   if (!recalled_at.is_zero()) {
     recall_release_count += n_caps;
-    if (recall_release_count >= recall_count) {
-      recalled_at = utime_t();
-      recall_count = 0;
-      recall_release_count = 0;
-    }
+    if (recall_release_count >= recall_count)
+      clear_recalled_at();
   }
 }
 
@@ -790,11 +787,20 @@ void Session::notify_recall_sent(int const new_limit)
   if (recalled_at.is_zero()) {
     // Entering recall phase, set up counters so we can later
     // judge whether the client has respected the recall request
-    recalled_at = ceph_clock_now(g_ceph_context);
+    recalled_at = last_recall_sent = ceph_clock_now(g_ceph_context);
     assert (new_limit < caps.size());  // Behaviour of Server::recall_client_state
     recall_count = caps.size() - new_limit;
     recall_release_count = 0;
+  } else {
+    last_recall_sent = ceph_clock_now(g_ceph_context);
   }
+}
+
+void Session::clear_recalled_at()
+{
+  recalled_at = last_recall_sent = utime_t();
+  recall_count = 0;
+  recall_release_count = 0;
 }
 
 void Session::set_client_metadata(map<string, string> const &meta)
@@ -854,7 +860,7 @@ int Session::check_access(CInode *in, unsigned mask,
     path = in->get_projected_inode()->stray_prior_path;
     dout(20) << __func__ << " stray_prior_path " << path << dendl;
   } else {
-    in->make_path_string(path, false, in->get_projected_parent_dn());
+    in->make_path_string(path, true);
     dout(20) << __func__ << " path " << path << dendl;
   }
   if (path.length())
@@ -991,5 +997,15 @@ bool SessionFilter::match(
   }
 
   return true;
+}
+
+std::ostream& operator<<(std::ostream &out, const Session &s)
+{
+ if (s.get_human_name() == stringify(s.info.inst.name.num())) {
+   out << s.get_human_name();
+ } else {
+   out << s.get_human_name() << " (" << std::dec << s.info.inst.name.num() << ")";
+ }
+ return out;
 }
 

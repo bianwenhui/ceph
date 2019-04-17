@@ -5,6 +5,10 @@
 
 #include <string>
 #include <map>
+#include <sstream>
+
+#include <boost/utility/string_ref.hpp>
+#include <boost/format.hpp>
 
 #include "common/errno.h"
 #include "common/ceph_json.h"
@@ -17,6 +21,7 @@
 #include "rgw_user.h"
 #include "rgw_string.h"
 
+#include "include/rados/librados.hpp"
 // until everything is moved from rgw_common
 #include "rgw_common.h"
 
@@ -131,9 +136,8 @@ int rgw_read_user_buckets(RGWRados * store,
     if (ret < 0)
       return ret;
 
-    for (list<cls_user_bucket_entry>::iterator q = entries.begin(); q != entries.end(); ++q) {
-      RGWBucketEnt e(*q);
-      buckets.add(e);
+    for (const auto& entry : entries) {
+      buckets.add(RGWBucketEnt(user_id, entry));
       total++;
     }
 
@@ -222,6 +226,7 @@ int rgw_link_bucket(RGWRados *store, const rgw_user& user_id, rgw_bucket& bucket
 
   ep.linked = true;
   ep.owner = user_id;
+  ep.bucket = bucket;
   ret = store->put_bucket_entrypoint_info(tenant_name, bucket_name, ep, false, ot, real_time(), &attrs);
   if (ret < 0)
     goto done_err;
@@ -298,6 +303,33 @@ int rgw_bucket_instance_remove_entry(RGWRados *store, string& entry, RGWObjVersi
   return store->meta_mgr->remove_entry(bucket_instance_meta_handler, entry, objv_tracker);
 }
 
+// 'tenant/' is used in bucket instance keys for sync to avoid parsing ambiguity
+// with the existing instance[:shard] format. once we parse the shard, the / is
+// replaced with a : to match the [tenant:]instance format
+void rgw_bucket_instance_key_to_oid(string& key)
+{
+  // replace tenant/ with tenant:
+  auto c = key.find('/');
+  if (c != string::npos) {
+    key[c] = ':';
+  }
+}
+
+// convert bucket instance oids back to the tenant/ format for metadata keys.
+// it's safe to parse 'tenant:' only for oids, because they won't contain the
+// optional :shard at the end
+void rgw_bucket_instance_oid_to_key(string& oid)
+{
+  // find first : (could be tenant:bucket or bucket:instance)
+  auto c = oid.find(':');
+  if (c != string::npos) {
+    // if we find another :, the first one was for tenant
+    if (oid.find(':', c + 1) != string::npos) {
+      oid[c] = '/';
+    }
+  }
+}
+
 int rgw_bucket_parse_bucket_instance(const string& bucket_instance, string *target_bucket_instance, int *shard_id)
 {
   ssize_t pos = bucket_instance.rfind(':');
@@ -324,6 +356,53 @@ int rgw_bucket_parse_bucket_instance(const string& bucket_instance, string *targ
   return 0;
 }
 
+// parse key in format: [tenant/]name:instance[:shard_id]
+int rgw_bucket_parse_bucket_key(CephContext *cct, const string& key,
+                                rgw_bucket *bucket, int *shard_id)
+{
+  boost::string_ref name{key};
+  boost::string_ref instance;
+
+  // split tenant/name
+  auto pos = name.find('/');
+  if (pos != boost::string_ref::npos) {
+    auto tenant = name.substr(0, pos);
+    bucket->tenant.assign(tenant.begin(), tenant.end());
+    name = name.substr(pos + 1);
+  }
+
+  // split name:instance
+  pos = name.find(':');
+  if (pos != boost::string_ref::npos) {
+    instance = name.substr(pos + 1);
+    name = name.substr(0, pos);
+  }
+  bucket->name.assign(name.begin(), name.end());
+
+  // split instance:shard
+  pos = instance.find(':');
+  if (pos == boost::string_ref::npos) {
+    bucket->bucket_id.assign(instance.begin(), instance.end());
+    *shard_id = -1;
+    return 0;
+  }
+
+  // parse shard id
+  auto shard = instance.substr(pos + 1);
+  string err;
+  auto id = strict_strtol(shard.data(), 10, &err);
+  if (!err.empty()) {
+    ldout(cct, 0) << "ERROR: failed to parse bucket shard '"
+        << instance.data() << "': " << err << dendl;
+    return -EINVAL;
+  }
+
+  *shard_id = id;
+  instance = instance.substr(0, pos);
+  bucket->bucket_id.assign(instance.begin(), instance.end());
+  return 0;
+}
+
 int rgw_bucket_set_attrs(RGWRados *store, RGWBucketInfo& bucket_info,
                          map<string, bufferlist>& attrs,
                          RGWObjVersionTracker *objv_tracker)
@@ -339,13 +418,9 @@ int rgw_bucket_set_attrs(RGWRados *store, RGWBucketInfo& bucket_info,
       return ret;
     }
   }
-  string oid;
-  store->get_bucket_meta_oid(bucket, oid);
-  rgw_obj obj(store->get_zone_params().domain_root, oid);
 
-  string key;
-  store->get_bucket_instance_entry(bucket, key); /* we want the bucket instance name without
-						    the oid prefix cruft */
+  /* we want the bucket instance name without the oid prefix cruft */
+  string key = bucket.get_key();
   bufferlist bl;
 
   ::encode(bucket_info, bl);
@@ -356,16 +431,9 @@ int rgw_bucket_set_attrs(RGWRados *store, RGWBucketInfo& bucket_info,
 static void dump_mulipart_index_results(list<rgw_obj_key>& objs_to_unlink,
         Formatter *f)
 {
-  // make sure that an appropiately titled header has been opened previously
-  list<rgw_obj_key>::iterator oiter = objs_to_unlink.begin();
-
-  f->open_array_section("invalid_multipart_entries");
-
-  for ( ; oiter != objs_to_unlink.end(); ++oiter) {
-    f->dump_string("object",  oiter->name);
+  for (const auto& o : objs_to_unlink) {
+    f->dump_string("object",  o.name);
   }
-
-  f->close_section();
 }
 
 void check_bad_user_bucket_mapping(RGWRados *store, const rgw_user& user_id,
@@ -459,9 +527,7 @@ int rgw_remove_bucket(RGWRados *store, rgw_bucket& bucket, bool delete_children)
   map<RGWObjCategory, RGWStorageStats> stats;
   std::vector<RGWObjEnt> objs;
   map<string, bool> common_prefixes;
-  rgw_obj obj;
   RGWBucketInfo info;
-  bufferlist bl;
   RGWObjectCtx obj_ctx(store);
 
   string bucket_ver, master_ver;
@@ -469,8 +535,6 @@ int rgw_remove_bucket(RGWRados *store, rgw_bucket& bucket, bool delete_children)
   ret = store->get_bucket_stats(bucket, RGW_NO_SHARD, &bucket_ver, &master_ver, stats, NULL);
   if (ret < 0)
     return ret;
-
-  obj.bucket = bucket;
 
   ret = store->get_bucket_info(obj_ctx, bucket.tenant, bucket.name, info, NULL);
   if (ret < 0)
@@ -490,7 +554,7 @@ int rgw_remove_bucket(RGWRados *store, rgw_bucket& bucket, bool delete_children)
 
     while (!objs.empty()) {
       std::vector<RGWObjEnt>::iterator it = objs.begin();
-      for (it = objs.begin(); it != objs.end(); ++it) {
+      for (; it != objs.end(); ++it) {
         ret = rgw_remove_object(store, info, bucket, (*it).key);
         if (ret < 0)
           return ret;
@@ -514,6 +578,172 @@ int rgw_remove_bucket(RGWRados *store, rgw_bucket& bucket, bool delete_children)
   if (ret < 0) {
     lderr(store->ctx()) << "ERROR: could not remove bucket " << bucket.name << dendl;
     return ret;
+  }
+
+  ret = rgw_unlink_bucket(store, info.owner, bucket.tenant, bucket.name, false);
+  if (ret < 0) {
+    lderr(store->ctx()) << "ERROR: unable to remove user bucket information" << dendl;
+  }
+
+  return ret;
+}
+
+static int aio_wait(librados::AioCompletion *handle)
+{
+  librados::AioCompletion *c = (librados::AioCompletion *)handle;
+  c->wait_for_safe();
+  int ret = c->get_return_value();
+  c->release();
+  return ret;
+}
+
+static int drain_handles(list<librados::AioCompletion *>& pending)
+{
+  int ret = 0;
+  while (!pending.empty()) {
+    librados::AioCompletion *handle = pending.front();
+    pending.pop_front();
+    int r = aio_wait(handle);
+    if (r < 0) {
+      ret = r;
+    }
+  }
+  return ret;
+}
+
+int rgw_remove_bucket_bypass_gc(RGWRados *store, rgw_bucket& bucket,
+                                int concurrent_max, bool keep_index_consistent)
+{
+  int ret;
+  map<RGWObjCategory, RGWStorageStats> stats;
+  std::vector<RGWObjEnt> objs;
+  map<string, bool> common_prefixes;
+  RGWBucketInfo info;
+  RGWObjectCtx obj_ctx(store);
+
+  string bucket_ver, master_ver;
+
+  ret = store->get_bucket_stats(bucket, RGW_NO_SHARD, &bucket_ver, &master_ver, stats, NULL);
+  if (ret < 0)
+    return ret;
+
+  ret = store->get_bucket_info(obj_ctx, bucket.tenant, bucket.name, info, NULL);
+  if (ret < 0)
+    return ret;
+
+
+  RGWRados::Bucket target(store, info);
+  RGWRados::Bucket::List list_op(&target);
+
+  list_op.params.list_versions = true;
+
+  std::list<librados::AioCompletion*> handles;
+
+  int max = 1000;
+  int max_aio = concurrent_max;
+  ret = list_op.list_objects(max, &objs, &common_prefixes, NULL);
+  if (ret < 0)
+    return ret;
+
+  while (!objs.empty()) {
+    std::vector<RGWObjEnt>::iterator it = objs.begin();
+    for (; it != objs.end(); ++it) {
+      RGWObjState *astate = NULL;
+      rgw_obj obj(bucket, (*it).key.name);
+      obj.set_instance((*it).key.instance);
+
+      ret = store->get_obj_state(&obj_ctx, obj, &astate, NULL);
+      if (ret == -ENOENT) {
+        dout(1) << "WARNING: cannot find obj state for obj " << obj.get_object() << dendl;
+        continue;
+      }
+      if (ret < 0) {
+        lderr(store->ctx()) << "ERROR: get obj state returned with error " << ret << dendl;
+        return ret;
+      }
+
+      if (astate->has_manifest) {
+        rgw_obj head_obj;
+        RGWObjManifest& manifest = astate->manifest;
+        RGWObjManifest::obj_iterator miter = manifest.obj_begin();
+
+        if (miter.get_location().ns.empty()) {
+          head_obj = miter.get_location();
+        }
+
+        for (; miter != manifest.obj_end() && max_aio--; ++miter) {
+          if (!max_aio) {
+            ret = drain_handles(handles);
+            if (ret < 0) {
+              lderr(store->ctx()) << "ERROR: could not drain handles as aio completion returned with " << ret << dendl;
+              return ret;
+            }
+            max_aio = concurrent_max;
+          }
+
+          rgw_obj last_obj = miter.get_location();
+          if (last_obj == head_obj) {
+            // have the head obj deleted at the end
+            continue;
+          }
+
+          ret = store->delete_obj_aio(last_obj, bucket, info, astate, handles, keep_index_consistent);
+          if (ret < 0) {
+            lderr(store->ctx()) << "ERROR: delete obj aio failed with " << ret << dendl;
+            return ret;
+          }
+        } // for all shadow objs
+
+        ret = store->delete_obj_aio(head_obj, bucket, info, astate, handles, keep_index_consistent);
+        if (ret < 0) {
+          lderr(store->ctx()) << "ERROR: delete obj aio failed with " << ret << dendl;
+          return ret;
+        }
+      }
+
+      if (!max_aio) {
+        ret = drain_handles(handles);
+        if (ret < 0) {
+          lderr(store->ctx()) << "ERROR: could not drain handles as aio completion returned with " << ret << dendl;
+          return ret;
+        }
+        max_aio = concurrent_max;
+      }
+    } // for all RGW objects
+    objs.clear();
+
+    ret = list_op.list_objects(max, &objs, &common_prefixes, NULL);
+    if (ret < 0)
+      return ret;
+  }
+
+  ret = drain_handles(handles);
+  if (ret < 0) {
+    lderr(store->ctx()) << "ERROR: could not drain handles as aio completion returned with " << ret << dendl;
+    return ret;
+  }
+
+  ret = rgw_bucket_sync_user_stats(store, bucket.tenant, bucket.name);
+  if (ret < 0) {
+     dout(1) << "WARNING: failed sync user stats before bucket delete. ret=" <<  ret << dendl;
+  }
+
+  RGWObjVersionTracker objv_tracker;
+
+  ret = rgw_bucket_delete_bucket_obj(store, bucket.tenant, bucket.name, objv_tracker);
+  if (ret < 0) {
+    lderr(store->ctx()) << "ERROR: could not remove bucket " << bucket.name << "with ret as " << ret << dendl;
+    return ret;
+  }
+
+  if (!store->is_syncing_bucket_meta(bucket)) {
+    RGWObjVersionTracker objv_tracker;
+    string entry = bucket.get_key();
+    ret = rgw_bucket_instance_remove_entry(store, entry, &objv_tracker);
+    if (ret < 0) {
+      lderr(store->ctx()) << "ERROR: could not remove bucket instance entry" << bucket.name << "with ret as " << ret << dendl;
+      return ret;
+    }
   }
 
   ret = rgw_unlink_bucket(store, info.owner, bucket.tenant, bucket.name, false);
@@ -664,7 +894,7 @@ int RGWBucket::link(RGWBucketAdminOpState& op_state, std::string *err_msg)
     rgw_obj obj_bucket_instance(bucket_instance, no_oid);
     r = store->system_obj_set_attr(NULL, obj_bucket_instance, RGW_ATTR_ACL, aclbl, &objv_tracker);
 
-    r = rgw_link_bucket(store, user_info.user_id, bucket, real_time());
+    r = rgw_link_bucket(store, user_info.user_id, bucket_info.bucket, real_time());
     if (r < 0)
       return r;
   }
@@ -689,12 +919,24 @@ int RGWBucket::unlink(RGWBucketAdminOpState& op_state, std::string *err_msg)
   return r;
 }
 
-int RGWBucket::remove(RGWBucketAdminOpState& op_state, std::string *err_msg)
+int RGWBucket::remove(RGWBucketAdminOpState& op_state, bool bypass_gc,
+                      bool keep_index_consistent, std::string *err_msg)
 {
   bool delete_children = op_state.will_delete_children();
   rgw_bucket bucket = op_state.get_bucket();
+  int ret;
 
-  int ret = rgw_remove_bucket(store, bucket, delete_children);
+  if (bypass_gc) {
+    if (delete_children) {
+      ret = rgw_remove_bucket_bypass_gc(store, bucket, op_state.get_max_aio(), keep_index_consistent);
+    } else {
+      set_err_msg(err_msg, "purge objects should be set for gc to be bypassed");
+      return -EINVAL;
+    }
+  } else {
+    ret = rgw_remove_bucket(store, bucket, delete_children);
+  }
+
   if (ret < 0) {
     set_err_msg(err_msg, "unable to remove bucket" + cpp_strerror(-ret));
     return ret;
@@ -759,16 +1001,17 @@ static void dump_index_check(map<RGWObjCategory, RGWStorageStats> existing_stats
 }
 
 int RGWBucket::check_bad_index_multipart(RGWBucketAdminOpState& op_state,
-        list<rgw_obj_key>& objs_to_unlink, std::string *err_msg)
+					 RGWFormatterFlusher& flusher,
+					 std::string *err_msg)
 {
   bool fix_index = op_state.will_fix_index();
   rgw_bucket bucket = op_state.get_bucket();
 
-  int max = 1000;
+  size_t max = 1000;
 
   map<string, bool> common_prefixes;
-  string ns = "multipart";
 
+  string ns = "multipart";
   bool is_truncated;
   map<string, bool> meta_objs;
   map<rgw_obj_key, string> all_objs;
@@ -785,6 +1028,7 @@ int RGWBucket::check_bad_index_multipart(RGWBucketAdminOpState& op_state,
   RGWRados::Bucket::List list_op(&target);
 
   list_op.params.list_versions = true;
+  list_op.params.ns = ns;
 
   do {
     vector<RGWObjEnt> result;
@@ -827,6 +1071,11 @@ int RGWBucket::check_bad_index_multipart(RGWBucketAdminOpState& op_state,
 
   } while (is_truncated);
 
+  list<rgw_obj_key> objs_to_unlink;
+  Formatter *f =  flusher.get_formatter();
+
+  f->open_array_section("invalid_multipart_entries");
+
   map<rgw_obj_key, string>::iterator aiter;
   for (aiter = all_objs.begin(); aiter != all_objs.end(); ++aiter) {
     string& name = aiter->second;
@@ -834,10 +1083,22 @@ int RGWBucket::check_bad_index_multipart(RGWBucketAdminOpState& op_state,
     if (meta_objs.find(name) == meta_objs.end()) {
       objs_to_unlink.push_back(aiter->first);
     }
-  }
 
-  if (objs_to_unlink.empty())
-    return 0;
+    if (objs_to_unlink.size() > max) {
+      if (fix_index) {
+	int r = store->remove_objs_from_index(bucket, objs_to_unlink);
+	if (r < 0) {
+	  set_err_msg(err_msg, "ERROR: remove_obj_from_index() returned error: "
+		      + cpp_strerror(-r));
+	  return r;
+	}
+      }
+
+      dump_mulipart_index_results(objs_to_unlink, flusher.get_formatter());
+      flusher.flush();
+      objs_to_unlink.clear();
+    }
+  }
 
   if (fix_index) {
     int r = store->remove_objs_from_index(bucket, objs_to_unlink);
@@ -848,6 +1109,10 @@ int RGWBucket::check_bad_index_multipart(RGWBucketAdminOpState& op_state,
       return r;
     }
   }
+
+  dump_mulipart_index_results(objs_to_unlink, f);
+  f->close_section();
+  flusher.flush();
 
   return 0;
 }
@@ -1066,7 +1331,6 @@ int RGWBucketAdminOp::check_index(RGWRados *store, RGWBucketAdminOpState& op_sta
   map<string, RGWObjEnt> result;
   map<RGWObjCategory, RGWStorageStats> existing_stats;
   map<RGWObjCategory, RGWStorageStats> calculated_stats;
-  list<rgw_obj_key> objs_to_unlink;
 
   RGWBucket bucket;
 
@@ -1077,12 +1341,9 @@ int RGWBucketAdminOp::check_index(RGWRados *store, RGWBucketAdminOpState& op_sta
   Formatter *formatter = flusher.get_formatter();
   flusher.start(0);
 
-  ret = bucket.check_bad_index_multipart(op_state, objs_to_unlink);
+  ret = bucket.check_bad_index_multipart(op_state, flusher);
   if (ret < 0)
     return ret;
-
-  dump_mulipart_index_results(objs_to_unlink, formatter);
-  flusher.flush();
 
   ret = bucket.check_object_index(op_state, result);
   if (ret < 0)
@@ -1101,7 +1362,8 @@ int RGWBucketAdminOp::check_index(RGWRados *store, RGWBucketAdminOpState& op_sta
   return 0;
 }
 
-int RGWBucketAdminOp::remove_bucket(RGWRados *store, RGWBucketAdminOpState& op_state)
+int RGWBucketAdminOp::remove_bucket(RGWRados *store, RGWBucketAdminOpState& op_state,
+                                    bool bypass_gc, bool keep_index_consistent)
 {
   RGWBucket bucket;
 
@@ -1109,7 +1371,12 @@ int RGWBucketAdminOp::remove_bucket(RGWRados *store, RGWBucketAdminOpState& op_s
   if (ret < 0)
     return ret;
 
-  return bucket.remove(op_state);
+  std::string err_msg;
+  ret = bucket.remove(op_state, bypass_gc, keep_index_consistent, &err_msg);
+  if (!err_msg.empty()) {
+    lderr(store->ctx()) << "ERROR: " << err_msg << dendl;
+  }
+  return ret;
 }
 
 int RGWBucketAdminOp::remove_object(RGWRados *store, RGWBucketAdminOpState& op_state)
@@ -1165,6 +1432,127 @@ static int bucket_stats(RGWRados *store, const std::string& tenant_name, std::st
   return 0;
 }
 
+int RGWBucketAdminOp::limit_check(RGWRados *store,
+				  RGWBucketAdminOpState& op_state,
+				  const std::list<std::string>& user_ids,
+				  RGWFormatterFlusher& flusher,
+				  bool warnings_only)
+{
+  int ret = 0;
+  const size_t max_entries =
+    store->ctx()->_conf->rgw_list_buckets_max_chunk;
+
+  const size_t safe_max_objs_per_shard =
+    store->ctx()->_conf->rgw_safe_max_objects_per_shard;
+
+  uint16_t shard_warn_pct =
+    store->ctx()->_conf->rgw_shard_warning_threshold;
+  if (shard_warn_pct > 100)
+    shard_warn_pct = 90;
+
+  Formatter *formatter = flusher.get_formatter();
+  flusher.start(0);
+
+  formatter->open_array_section("users");
+
+  for (const auto& user_id : user_ids) {
+    formatter->open_object_section("user");
+    formatter->dump_string("user_id", user_id);
+    bool done;
+    formatter->open_array_section("buckets");
+    do {
+      RGWUserBuckets buckets;
+      string marker;
+      bool is_truncated;
+
+      ret = rgw_read_user_buckets(store, user_id, buckets,
+				  marker, string(), max_entries, false,
+				  &is_truncated);
+      if (ret < 0)
+        return ret;
+
+      map<string, RGWBucketEnt>& m_buckets = buckets.get_buckets();
+
+      for (auto& iter : m_buckets) {
+	auto& bucket = iter.second.bucket;
+	uint32_t num_shards = 1;
+	uint64_t num_objects = 0;
+
+	/* need info for num_shards */
+	RGWBucketInfo info;
+	RGWObjectCtx obj_ctx(store);
+
+	marker = bucket.name; /* Casey's location for marker update,
+			       * as we may now not reach the end of
+			       * the loop body */
+
+	ret = store->get_bucket_info(obj_ctx, bucket.tenant, bucket.name,
+				     info, nullptr);
+	if (ret < 0)
+	  continue;
+
+	/* need stats for num_entries */
+	string bucket_ver, master_ver;
+	std::map<RGWObjCategory, RGWStorageStats> stats;
+	ret = store->get_bucket_stats(bucket, RGW_NO_SHARD, &bucket_ver,
+				      &master_ver, stats, nullptr);
+
+	if (ret < 0)
+	  continue;
+
+	for (const auto& s : stats) {
+	    num_objects += s.second.num_objects;
+	}
+
+	num_shards = info.num_shards;
+	uint64_t objs_per_shard =
+	  (num_shards) ? num_objects/num_shards : num_objects;
+	{
+	  bool warn = false;
+	  stringstream ss;
+	  if (objs_per_shard > safe_max_objs_per_shard) {
+	    double over =
+	      100 - (safe_max_objs_per_shard/objs_per_shard * 100);
+	      ss << boost::format("OVER %4f%%") % over;
+	      warn = true;
+	  } else {
+	    double fill_pct =
+	      objs_per_shard / safe_max_objs_per_shard * 100;
+	    if (fill_pct >= shard_warn_pct) {
+	      ss << boost::format("WARN %4f%%") % fill_pct;
+	      warn = true;
+	    } else {
+	      ss << "OK";
+	    }
+	  }
+
+	  if (warn || (! warnings_only)) {
+	    formatter->open_object_section("bucket");
+	    formatter->dump_string("bucket", bucket.name);
+	    formatter->dump_string("tenant", bucket.tenant);
+	    formatter->dump_int("num_objects", num_objects);
+	    formatter->dump_int("num_shards", num_shards);
+	    formatter->dump_int("objects_per_shard", objs_per_shard);
+	    formatter->dump_string("fill_status", ss.str());
+	    formatter->close_section();
+	  }
+	}
+      }
+
+      done = (m_buckets.size() < max_entries);
+    } while (!done); /* foreach: bucket */
+
+    formatter->close_section();
+    formatter->close_section();
+    formatter->flush(cout);
+
+  } /* foreach: user_id */
+
+  formatter->close_section();
+  formatter->flush(cout);
+
+  return ret;
+} /* RGWBucketAdminOp::limit_check */
 
 int RGWBucketAdminOp::info(RGWRados *store, RGWBucketAdminOpState& op_state,
                   RGWFormatterFlusher& flusher)
@@ -1185,7 +1573,7 @@ int RGWBucketAdminOp::info(RGWRados *store, RGWBucketAdminOpState& op_state,
 
   CephContext *cct = store->ctx();
 
-  size_t max_entries = cct->_conf->rgw_list_buckets_max_chunk;
+  const size_t max_entries = cct->_conf->rgw_list_buckets_max_chunk;
 
   bool show_stats = op_state.will_fetch_stats();
   rgw_user user_id = op_state.get_user_id();
@@ -1320,8 +1708,6 @@ int RGWDataChangesLog::renew_entries()
   real_time ut = real_clock::now();
   for (iter = entries.begin(); iter != entries.end(); ++iter) {
     const rgw_bucket_shard& bs = iter->first;
-    const rgw_bucket& bucket = bs.bucket;
-    int shard_id = bs.shard_id;
 
     int index = choose_oid(bs);
 
@@ -1330,19 +1716,14 @@ int RGWDataChangesLog::renew_entries()
     rgw_data_change change;
     bufferlist bl;
     change.entity_type = ENTITY_TYPE_BUCKET;
-    change.key = bucket.name + ":" + bucket.bucket_id;
-    if (shard_id >= 0) {
-      char buf[16];
-      snprintf(buf, sizeof(buf), ":%d", shard_id);
-      change.key += buf;
-    }
+    change.key = bs.get_key();
     change.timestamp = ut;
     ::encode(change, bl);
 
-    store->time_log_prepare_entry(entry, ut, section, bucket.name, bl);
+    store->time_log_prepare_entry(entry, ut, section, change.key, bl);
 
     m[index].first.push_back(bs);
-    m[index].second.push_back(entry);
+    m[index].second.emplace_back(std::move(entry));
   }
 
   map<int, pair<list<rgw_bucket_shard>, list<cls_log_entry> > >::iterator miter;
@@ -1470,12 +1851,7 @@ int RGWDataChangesLog::add_entry(rgw_bucket& bucket, int shard_id) {
     bufferlist bl;
     rgw_data_change change;
     change.entity_type = ENTITY_TYPE_BUCKET;
-    change.key = bucket.name + ":" + bucket.bucket_id;
-    if (shard_id >= 0) {
-      char buf[16];
-      snprintf(buf, sizeof(buf), ":%d", shard_id);
-      change.key += buf;
-    }
+    change.key = bs.get_key();
     change.timestamp = now;
     ::encode(change, bl);
     string section;
@@ -1509,6 +1885,8 @@ int RGWDataChangesLog::list_entries(int shard, const real_time& start_time, cons
 				    const string& marker,
 				    string *out_marker,
 				    bool *truncated) {
+  if (shard >= num_shards)
+    return -EINVAL;
 
   list<cls_log_entry> log_entries;
 
@@ -1565,7 +1943,7 @@ int RGWDataChangesLog::list_entries(const real_time& start_time, const real_time
 
 int RGWDataChangesLog::get_info(int shard_id, RGWDataChangesLogInfo *info)
 {
-  if (shard_id > num_shards)
+  if (shard_id >= num_shards)
     return -EINVAL;
 
   string oid = oids[shard_id];
@@ -1592,7 +1970,7 @@ int RGWDataChangesLog::trim_entries(int shard_id, const real_time& start_time, c
 
   ret = store->time_log_trim(oids[shard_id], start_time, end_time, start_marker, end_marker);
 
-  if (ret == -ENOENT)
+  if (ret == -ENOENT || ret == -ENODATA)
     ret = 0;
 
   return ret;
@@ -1603,7 +1981,7 @@ int RGWDataChangesLog::trim_entries(const real_time& start_time, const real_time
 {
   for (int shard = 0; shard < num_shards; shard++) {
     int ret = store->time_log_trim(oids[shard], start_time, end_time, start_marker, end_marker);
-    if (ret == -ENOENT) {
+    if (ret == -ENOENT || ret == -ENODATA) {
       continue;
     }
     if (ret < 0)
@@ -1652,12 +2030,9 @@ void RGWDataChangesLog::ChangesRenewThread::stop()
   cond.Signal();
 }
 
-void RGWDataChangesLog::mark_modified(int shard_id, rgw_bucket_shard& bs)
+void RGWDataChangesLog::mark_modified(int shard_id, const rgw_bucket_shard& bs)
 {
-  string key = bs.bucket.name + ":" + bs.bucket.bucket_id;
-  char buf[16];
-  snprintf(buf, sizeof(buf), ":%d", bs.shard_id);
-  key.append(buf);
+  auto key = bs.get_key();
   modified_lock.get_read();
   map<int, set<string> >::iterator iter = modified_shards.find(shard_id);
   if (iter != modified_shards.end()) {
@@ -1776,7 +2151,7 @@ public:
       return ret;
 
     /*
-     * We're unlinking the bucket but we don't want to update the entrypoint here — we're removing
+     * We're unlinking the bucket but we don't want to update the entrypoint here - we're removing
      * it immediately and don't want to invalidate our cached objv_version or the bucket obj removal
      * will incorrectly fail.
      */
@@ -1891,9 +2266,11 @@ public:
 
     if (!exists || old_bci.info.bucket.bucket_id != bci.info.bucket.bucket_id) {
       /* a new bucket, we need to select a new bucket placement for it */
+      auto key(entry);
+      rgw_bucket_instance_oid_to_key(key);
       string tenant_name;
       string bucket_name;
-      parse_bucket(entry, tenant_name, bucket_name);
+      parse_bucket(key, tenant_name, bucket_name);
 
       rgw_bucket bucket;
       RGWZonePlacementInfo rule_info;
@@ -1903,14 +2280,16 @@ public:
         ldout(store->ctx(), 0) << "ERROR: select_bucket_placement() returned " << ret << dendl;
         return ret;
       }
+      bci.info.bucket.tenant = bucket.tenant;
       bci.info.bucket.data_pool = bucket.data_pool;
       bci.info.bucket.index_pool = bucket.index_pool;
+      bci.info.bucket.data_extra_pool = bucket.data_extra_pool;
       bci.info.index_type = rule_info.index_type;
     } else {
       /* existing bucket, keep its placement pools */
       bci.info.bucket.data_pool = old_bci.info.bucket.data_pool;
       bci.info.bucket.index_pool = old_bci.info.bucket.index_pool;
-      bci.info.index_type = old_bci.info.index_type;
+      bci.info.bucket.data_extra_pool = old_bci.info.bucket.data_extra_pool;
     }
 
     // are we actually going to perform this put, or is it too old?
@@ -1956,6 +2335,7 @@ public:
 
   void get_pool_and_oid(RGWRados *store, const string& key, rgw_bucket& bucket, string& oid) {
     oid = RGW_BUCKET_INSTANCE_MD_PREFIX + key;
+    rgw_bucket_instance_key_to_oid(oid);
     bucket = store->get_zone_params().domain_root;
   }
 
@@ -1991,14 +2371,16 @@ public:
       return 0;
     }
 
-    int prefix_size = sizeof(RGW_BUCKET_INSTANCE_MD_PREFIX) - 1;
+    constexpr int prefix_size = sizeof(RGW_BUCKET_INSTANCE_MD_PREFIX) - 1;
     // now filter in the relevant entries
     list<string>::iterator iter;
     for (iter = unfiltered_keys.begin(); iter != unfiltered_keys.end(); ++iter) {
       string& k = *iter;
 
       if (k.compare(0, prefix_size, RGW_BUCKET_INSTANCE_MD_PREFIX) == 0) {
-        keys.push_back(k.substr(prefix_size));
+        auto oid = k.substr(prefix_size);
+        rgw_bucket_instance_oid_to_key(oid);
+        keys.emplace_back(std::move(oid));
       }
     }
 

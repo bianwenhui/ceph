@@ -35,6 +35,7 @@
 #include "include/xlist.h"
 #include "include/atomic.h"
 #include "SnapMapper.h"
+#include "common/Timer.h"
 
 #include "PGLog.h"
 #include "OpRequest.h"
@@ -547,7 +548,7 @@ public:
   pg_shard_t pg_whoami;
   pg_shard_t up_primary;
   vector<int> up, acting, want_acting;
-  set<pg_shard_t> actingbackfill, actingset;
+  set<pg_shard_t> actingbackfill, actingset, upset;
   map<pg_shard_t,eversion_t> peer_last_complete_ondisk;
   eversion_t  min_last_complete_ondisk;  // up: min over last_complete_ondisk, peer_last_complete_ondisk
   eversion_t  pg_trim_to;
@@ -872,22 +873,20 @@ protected:
 public:
   void clear_primary_state();
 
- public:
   bool is_actingbackfill(pg_shard_t osd) const {
     return actingbackfill.count(osd);
   }
   bool is_acting(pg_shard_t osd) const {
-    if (pool.info.ec_pool()) {
-      return acting.size() > (unsigned)osd.shard && acting[osd.shard] == osd.osd;
-    } else {
-      return std::find(acting.begin(), acting.end(), osd.osd) != acting.end();
-    }
+    return has_shard(pool.info.ec_pool(), acting, osd);
   }
   bool is_up(pg_shard_t osd) const {
-    if (pool.info.ec_pool()) {
-      return up.size() > (unsigned)osd.shard && up[osd.shard] == osd.osd;
+    return has_shard(pool.info.ec_pool(), up, osd);
+  }
+  static bool has_shard(bool ec, const vector<int>& v, pg_shard_t osd) {
+    if (ec) {
+      return v.size() > (unsigned)osd.shard && v[osd.shard] == osd.osd;
     } else {
-      return std::find(up.begin(), up.end(), osd.osd) != up.end();
+      return std::find(v.begin(), v.end(), osd.osd) != v.end();
     }
   }
   
@@ -1049,6 +1048,7 @@ public:
 
   map<pg_shard_t, pg_info_t>::const_iterator find_best_info(
     const map<pg_shard_t, pg_info_t> &infos,
+    bool restrict_to_up_acting,
     bool *history_les_bound) const;
   static void calc_ec_acting(
     map<pg_shard_t, pg_info_t>::const_iterator auth_log_shard,
@@ -1059,6 +1059,7 @@ public:
     pg_shard_t up_primary,
     const map<pg_shard_t, pg_info_t> &all_info,
     bool compat_mode,
+    bool restrict_to_up_acting,
     vector<int> *want,
     set<pg_shard_t> *backfill,
     set<pg_shard_t> *acting_backfill,
@@ -1073,12 +1074,14 @@ public:
     pg_shard_t up_primary,
     const map<pg_shard_t, pg_info_t> &all_info,
     bool compat_mode,
+    bool restrict_to_up_acting,
     vector<int> *want,
     set<pg_shard_t> *backfill,
     set<pg_shard_t> *acting_backfill,
     pg_shard_t *want_primary,
     ostream &ss);
   bool choose_acting(pg_shard_t &auth_log_shard,
+		     bool restrict_to_up_acting,
 		     bool *history_les_bound);
   void build_might_have_unfound();
   void replay_queued_ops();
@@ -1156,8 +1159,16 @@ public:
     OpRequestRef active_rep_scrub;
     utime_t scrub_reg_stamp;  // stamp we registered for
 
+    // For async sleep
+    bool sleeping = false;
+    bool needs_sleep = true;
+    utime_t sleep_start;
+
     // flags to indicate explicitly requested scrubs (by admin)
     bool must_scrub, must_deep_scrub, must_repair;
+
+    // Priority to use for scrub scheduling
+    unsigned priority;
 
     // this flag indicates whether we would like to do auto-repair of the PG or not
     bool auto_repair;
@@ -1168,6 +1179,9 @@ public:
 
     // Map from object with errors to good peers
     map<hobject_t, list<pair<ScrubMap::object, pg_shard_t> >, hobject_t::BitwiseComparator> authoritative;
+
+    // Cleaned map pending snap metadata scrub
+    ScrubMap cleaned_meta_map;
 
     // digest updates which we are waiting on
     int num_digest_updates_pending;
@@ -1227,11 +1241,28 @@ public:
 
     bool is_chunky_scrub_active() const { return state != INACTIVE; }
 
-    // classic (non chunk) scrubs block all writes
-    // chunky scrubs only block writes to a range
+    /* We use an inclusive upper bound here because the replicas scan .end
+     * as well in hammer (see http://tracker.ceph.com/issues/17491).
+     *
+     * The boundary can only be
+     * 1) Not an object (object boundary) or
+     * 2) A clone
+     * In case 1), it doesn't matter.  In case 2), we might fail to
+     * wait for an un-applied snap trim to complete, or fail to block an
+     * eviction on a tail object.  In such a case the replica might
+     * erroneously detect a snap_mapper/attr mismatch and "fix" the
+     * snap_mapper to the old value.
+     *
+     * @see _range_available_for_scrub
+     * @see chunk_scrub (the part where it determines the last relelvant log
+     *      entry)
+     *
+     * TODO: switch this logic back to an exclusive upper bound once the
+     * replicas don't scan the upper boundary
+     */
     bool write_blocked_by_scrub(const hobject_t &soid, bool sort_bitwise) {
       if (cmp(soid, start, sort_bitwise) >= 0 &&
-	  cmp(soid, end, sort_bitwise) < 0)
+	  cmp(soid, end, sort_bitwise) <= 0)
 	return true;
 
       return false;
@@ -1267,6 +1298,10 @@ public:
       missing.clear();
       authoritative.clear();
       num_digest_updates_pending = 0;
+      cleaned_meta_map = ScrubMap();
+      sleeping = false;
+      needs_sleep = true;
+      sleep_start = utime_t();
     }
 
     void create_results(const hobject_t& obj);
@@ -1291,6 +1326,7 @@ public:
   void scrub_finish();
   void scrub_clear_state();
   void _scan_snaps(ScrubMap &map);
+  void _repair_oinfo_oid(ScrubMap &map);
   void _scan_rollback_obs(
     const vector<ghobject_t> &rollback_obs,
     ThreadPool::TPHandle &handle);
@@ -2145,7 +2181,15 @@ public:
 	    acting[i],
 	    pool.info.ec_pool() ? shard_id_t(i) : shard_id_t::NO_SHARD));
     }
+    upset.clear();
     up = newup;
+    for (uint8_t i = 0; i < up.size(); ++i) {
+      if (up[i] != CRUSH_ITEM_NONE)
+	upset.insert(
+	  pg_shard_t(
+	    up[i],
+	    pool.info.ec_pool() ? shard_id_t(i) : shard_id_t::NO_SHARD));
+    }
     if (!pool.info.ec_pool()) {
       up_primary = pg_shard_t(new_up_primary, shard_id_t::NO_SHARD);
       primary = pg_shard_t(new_acting_primary, shard_id_t::NO_SHARD);

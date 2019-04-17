@@ -138,6 +138,17 @@ int CLSRGWIssueSetTagTimeout::issue_op(int shard_id, const string& oid)
   return issue_bucket_set_tag_timeout_op(io_ctx, oid, tag_timeout, &manager);
 }
 
+void cls_rgw_bucket_update_stats(librados::ObjectWriteOperation& o, bool absolute,
+                                 const map<uint8_t, rgw_bucket_category_stats>& stats)
+{
+  struct rgw_cls_bucket_update_stats_op call;
+  call.absolute = absolute;
+  call.stats = stats;
+  bufferlist in;
+  ::encode(call, in);
+  o.exec("rgw", "bucket_update_stats", in);
+}
+
 void cls_rgw_bucket_prepare_op(ObjectWriteOperation& o, RGWModifyOp op, string& tag,
                                const cls_rgw_obj_key& key, const string& locator, bool log_op,
                                uint16_t bilog_flags)
@@ -275,6 +286,15 @@ int cls_rgw_bi_put(librados::IoCtx& io_ctx, const string oid, rgw_cls_bi_entry& 
     return r;
 
   return 0;
+}
+
+void cls_rgw_bi_put(ObjectWriteOperation& op, const string oid, rgw_cls_bi_entry& entry)
+{
+  bufferlist in, out;
+  struct rgw_cls_bi_put_op call;
+  call.entry = entry;
+  ::encode(call, in);
+  op.exec("rgw", "bi_put", in);
 }
 
 int cls_rgw_bi_list(librados::IoCtx& io_ctx, const string oid,
@@ -614,7 +634,7 @@ void cls_rgw_gc_defer_entry(ObjectWriteOperation& op, uint32_t expiration_secs, 
 }
 
 int cls_rgw_gc_list(IoCtx& io_ctx, string& oid, string& marker, uint32_t max, bool expired_only,
-                    list<cls_rgw_gc_obj_info>& entries, bool *truncated)
+                    list<cls_rgw_gc_obj_info>& entries, bool *truncated, string& next_marker)
 {
   bufferlist in, out;
   cls_rgw_gc_list_op call;
@@ -638,8 +658,8 @@ int cls_rgw_gc_list(IoCtx& io_ctx, string& oid, string& marker, uint32_t max, bo
 
   if (truncated)
     *truncated = ret.truncated;
-
- return r;
+  next_marker = std::move(ret.next_marker);
+  return r;
 }
 
 void cls_rgw_gc_remove(librados::ObjectWriteOperation& op, const list<string>& tags)

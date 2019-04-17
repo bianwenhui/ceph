@@ -78,8 +78,9 @@ int main(int argc, const char **argv, const char *envp[]) {
   }
   env_to_vec(args);
 
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_DAEMON,
-	      CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
+  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+			 CODE_ENVIRONMENT_DAEMON,
+			 CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS);
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ) {
     if (ceph_argparse_double_dash(args, i)) {
       break;
@@ -152,10 +153,12 @@ int main(int argc, const char **argv, const char *envp[]) {
 #if defined(__linux__)
 	int ver = get_linux_version();
 	assert(ver != 0);
-	bool can_invalidate_dentries = g_conf->client_try_dentry_invalidate &&
-				       ver < KERNEL_VERSION(3, 18, 0);
+        bool client_try_dentry_invalidate = g_conf->client_try_dentry_invalidate;
+	bool can_invalidate_dentries = 
+          client_try_dentry_invalidate && ver < KERNEL_VERSION(3, 18, 0);
 	int tr = client->test_dentry_handling(can_invalidate_dentries);
-	if (tr != 0) {
+        bool client_die_on_failed_dentry_invalidate = g_conf->client_die_on_failed_dentry_invalidate;
+	if (tr != 0 && client_die_on_failed_dentry_invalidate) {
 	  cerr << "ceph-fuse[" << getpid()
 	       << "]: fuse failed dentry invalidate/remount test with error "
 	       << cpp_strerror(tr) << ", stopping" << std::endl;
@@ -289,7 +292,6 @@ int main(int argc, const char **argv, const char *envp[]) {
     }
     
     delete messenger;
-    g_ceph_context->put();
     free(newargv);
     
     delete mc;
@@ -297,6 +299,8 @@ int main(int argc, const char **argv, const char *envp[]) {
     //cout << "child done" << std::endl;
     return r;
   } else {
+    if (restart_log)
+      g_ceph_context->_log->start();
     // i am the parent
     //cout << "parent, waiting for signal" << std::endl;
     ::close(fd[1]);

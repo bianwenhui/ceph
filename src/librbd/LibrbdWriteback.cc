@@ -122,7 +122,12 @@ namespace librbd {
 
     virtual void complete(int r) {
       if (request_sent || r < 0) {
-        commit_io_event_extent(r);
+        if (request_sent && r == 0) {
+          // only commit IO events that are safely recorded to the backing image
+          // since the cache will retry all IOs that fail
+          commit_io_event_extent(0);
+        }
+
         req_comp->complete(r);
         delete this;
       } else {
@@ -162,7 +167,7 @@ namespace librbd {
 
       request_sent = true;
       AioObjectWrite *req = new AioObjectWrite(image_ctx, oid, object_no, off,
-                                               bl, snapc, this);
+                                               bl, snapc, this, 0);
       req->send();
     }
   };
@@ -274,7 +279,7 @@ namespace librbd {
 					      journal_tid));
     } else {
       AioObjectWrite *req = new AioObjectWrite(m_ictx, oid.name, object_no,
-					       off, bl, snapc, req_comp);
+					       off, bl, snapc, req_comp, 0);
       req->send();
     }
     return ++m_tid;

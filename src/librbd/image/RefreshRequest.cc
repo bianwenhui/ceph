@@ -2,10 +2,8 @@
 // vim: ts=8 sw=2 smarttab
 
 #include "librbd/image/RefreshRequest.h"
-#include "include/stringify.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
 #include "cls/lock/cls_lock_client.h"
 #include "cls/rbd/cls_rbd_client.h"
 #include "librbd/AioImageRequestWQ.h"
@@ -15,6 +13,7 @@
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
 #include "librbd/image/RefreshParentRequest.h"
+#include "librbd/journal/Policy.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -29,8 +28,9 @@ using util::create_context_callback;
 
 template <typename I>
 RefreshRequest<I>::RefreshRequest(I &image_ctx, bool acquiring_lock,
-                                  Context *on_finish)
+                                  bool skip_open_parent, Context *on_finish)
   : m_image_ctx(image_ctx), m_acquiring_lock(acquiring_lock),
+    m_skip_open_parent_image(skip_open_parent),
     m_on_finish(create_async_context_callback(m_image_ctx, on_finish)),
     m_error_result(0), m_flush_aio(false), m_exclusive_lock(nullptr),
     m_object_map(nullptr), m_journal(nullptr), m_refresh_parent(nullptr) {
@@ -398,8 +398,8 @@ void RefreshRequest<I>::send_v2_refresh_parent() {
 
     parent_info parent_md;
     int r = get_parent_info(m_image_ctx.snap_id, &parent_md);
-    if (r < 0 ||
-        RefreshParentRequest<I>::is_refresh_required(m_image_ctx, parent_md)) {
+    if (!m_skip_open_parent_image && (r < 0 ||
+        RefreshParentRequest<I>::is_refresh_required(m_image_ctx, parent_md))) {
       CephContext *cct = m_image_ctx.cct;
       ldout(cct, 10) << this << " " << __func__ << dendl;
 
@@ -478,18 +478,28 @@ Context *RefreshRequest<I>::handle_v2_init_exclusive_lock(int *result) {
 
 template <typename I>
 void RefreshRequest<I>::send_v2_open_journal() {
-  if ((m_features & RBD_FEATURE_JOURNALING) == 0 ||
-      m_image_ctx.read_only ||
-      !m_image_ctx.snap_name.empty() ||
-      m_image_ctx.journal != nullptr ||
-      m_image_ctx.exclusive_lock == nullptr ||
-      !m_image_ctx.exclusive_lock->is_lock_owner()) {
+  bool journal_disabled = (
+    (m_features & RBD_FEATURE_JOURNALING) == 0 ||
+     m_image_ctx.read_only ||
+     !m_image_ctx.snap_name.empty() ||
+     m_image_ctx.journal != nullptr ||
+     m_image_ctx.exclusive_lock == nullptr ||
+     !m_image_ctx.exclusive_lock->is_lock_owner());
+  bool journal_disabled_by_policy;
+  {
+    RWLock::RLocker snap_locker(m_image_ctx.snap_lock);
+    journal_disabled_by_policy = (
+      !journal_disabled &&
+      m_image_ctx.get_journal_policy()->journal_disabled());
+  }
 
+  if (journal_disabled || journal_disabled_by_policy) {
     // journal dynamically enabled -- doesn't own exclusive lock
     if ((m_features & RBD_FEATURE_JOURNALING) != 0 &&
+        !journal_disabled_by_policy &&
         m_image_ctx.exclusive_lock != nullptr &&
         m_image_ctx.journal == nullptr) {
-      m_image_ctx.aio_work_queue->set_require_lock_on_read();
+      m_image_ctx.aio_work_queue->set_require_lock(AIO_DIRECTION_BOTH, true);
     }
     send_v2_block_writes();
     return;
@@ -926,8 +936,8 @@ void RefreshRequest<I>::apply() {
       }
       if (!m_image_ctx.test_features(RBD_FEATURE_JOURNALING,
                                      m_image_ctx.snap_lock)) {
-        if (m_image_ctx.journal != nullptr) {
-          m_image_ctx.aio_work_queue->clear_require_lock_on_read();
+        if (!m_image_ctx.clone_copy_on_read && m_image_ctx.journal != nullptr) {
+          m_image_ctx.aio_work_queue->set_require_lock(AIO_DIRECTION_READ, false);
         }
         std::swap(m_journal, m_image_ctx.journal);
       } else if (m_journal != nullptr) {

@@ -92,7 +92,7 @@ void MDSMonitor::create_new_fs(FSMap &fsm, const std::string &name,
 {
   auto fs = std::make_shared<Filesystem>();
   fs->mds_map.fs_name = name;
-  fs->mds_map.max_mds = g_conf->max_mds;
+  fs->mds_map.max_mds = 1;
   fs->mds_map.data_pools.insert(data_pool);
   fs->mds_map.metadata_pool = metadata_pool;
   fs->mds_map.cas_pool = -1;
@@ -453,6 +453,7 @@ bool MDSMonitor::preprocess_offload_targets(MonOpRequestRef op)
   return false;
 
  done:
+  mon->no_reply(op);
   return true;
 }
 
@@ -616,7 +617,8 @@ bool MDSMonitor::prepare_beacon(MonOpRequestRef op)
       dout(4) << __func__ << ": marking rank "
               << info.rank << " damaged" << dendl;
 
-      const utime_t until = ceph_clock_now(g_ceph_context);
+      utime_t until = ceph_clock_now(g_ceph_context);
+      until += g_conf->mds_blacklist_interval;
       const auto blacklist_epoch = mon->osdmon()->blacklist(info.addr, until);
       request_proposal(mon->osdmon());
       pending_fsmap.damaged(gid, blacklist_epoch);
@@ -673,6 +675,7 @@ bool MDSMonitor::prepare_offload_targets(MonOpRequestRef op)
   } else {
     dout(10) << "prepare_offload_targets " << gid << " not in map" << dendl;
   }
+  mon->no_reply(op);
   return true;
 }
 
@@ -1472,7 +1475,7 @@ class FlagSetHandler : public FileSystemCommandHandler
         return r;
       }
 
-      bool jewel = mon->get_quorum_features() && CEPH_FEATURE_SERVER_JEWEL;
+      bool jewel = mon->get_quorum_features() & CEPH_FEATURE_SERVER_JEWEL;
       if (flag_bool && !jewel) {
         ss << "Multiple-filesystems are forbidden until all mons are updated";
         return -EINVAL;
@@ -1554,7 +1557,7 @@ int MDSMonitor::management_command(
       }
     }
 
-    if (pending_fsmap.any_filesystems()
+    if (pending_fsmap.filesystem_count() > 0
         && !pending_fsmap.get_enable_multiple()) {
       ss << "Creation of multiple filesystems is disabled.  To enable "
             "this experimental feature, use 'ceph fs flag set enable_multiple "
@@ -1681,7 +1684,7 @@ int MDSMonitor::management_command(
     // Carry forward what makes sense
     new_fs->fscid = fs->fscid;
     new_fs->mds_map.inline_data_enabled = fs->mds_map.inline_data_enabled;
-    new_fs->mds_map.max_mds = g_conf->max_mds;
+    new_fs->mds_map.max_mds = 1;
     new_fs->mds_map.data_pools = fs->mds_map.data_pools;
     new_fs->mds_map.metadata_pool = fs->mds_map.metadata_pool;
     new_fs->mds_map.cas_pool = fs->mds_map.cas_pool;
@@ -2197,7 +2200,6 @@ int MDSMonitor::filesystem_command(
       pending_fsmap.modify_daemon(gid, [state](MDSMap::mds_info_t *info) {
         info->state = state;
       });
-      stringstream ss;
       ss << "set mds gid " << gid << " to state " << state << " "
          << ceph_mds_state_name(state);
       return 0;
@@ -2228,7 +2230,6 @@ int MDSMonitor::filesystem_command(
         return -EBUSY;
       } else {
         pending_fsmap.erase(gid, {});
-        stringstream ss;
         ss << "removed mds gid " << gid;
         return 0;
       }
@@ -2258,7 +2259,6 @@ int MDSMonitor::filesystem_command(
       fs->mds_map.failed.erase(role.rank);
     });
 
-    stringstream ss;
     ss << "removed failed mds." << role;
     return 0;
   } else if (prefix == "mds compat rm_compat") {
@@ -2414,22 +2414,22 @@ void MDSMonitor::check_subs()
 {
   std::list<std::string> types;
 
-  // Subscriptions may be to "fsmap" (MDS and legacy clients),
-  // "fsmap.<namespace>", or to "fsmap" for the full state of all
+  // Subscriptions may be to "mdsmap" (MDS and legacy clients),
+  // "mdsmap.<namespace>", or to "fsmap" for the full state of all
   // filesystems.  Build a list of all the types we service
   // subscriptions for.
-  types.push_back("mdsmap");
   types.push_back("fsmap");
+  types.push_back("mdsmap");
   for (const auto &i : fsmap.filesystems) {
     auto fscid = i.first;
     std::ostringstream oss;
-    oss << "fsmap." << fscid;
+    oss << "mdsmap." << fscid;
     types.push_back(oss.str());
   }
 
   for (const auto &type : types) {
     if (mon->session_map.subs.count(type) == 0)
-      return;
+      continue;
     xlist<Subscription*>::iterator p = mon->session_map.subs[type]->begin();
     while (!p.end()) {
       Subscription *sub = *p;
@@ -2785,14 +2785,20 @@ bool MDSMonitor::maybe_promote_standby(std::shared_ptr<Filesystem> fs)
 	do_propose = true;
       }
     }
-  }
+  } else {
+    // There were no failures to replace, so try using any available standbys
+    // as standby-replay daemons.
 
-  // There were no failures to replace, so try using any available standbys
-  // as standby-replay daemons.
-  if (failed.empty()) {
+    // Take a copy of the standby GIDs so that we can iterate over
+    // them while perhaps-modifying standby_daemons during the loop
+    // (if we promote anyone they are removed from standby_daemons)
+    std::vector<mds_gid_t> standby_gids;
     for (const auto &j : pending_fsmap.standby_daemons) {
-      const auto &gid = j.first;
-      const auto &info = j.second;
+      standby_gids.push_back(j.first);
+    }
+
+    for (const auto &gid : standby_gids) {
+      const auto &info = pending_fsmap.standby_daemons.at(gid);
       assert(info.state == MDSMap::STATE_STANDBY);
 
       if (!info.standby_replay) {
@@ -2813,6 +2819,16 @@ bool MDSMonitor::maybe_promote_standby(std::shared_ptr<Filesystem> fs)
           info.standby_for_fscid == FS_CLUSTER_ID_NONE ?
             pending_fsmap.legacy_client_fscid : info.standby_for_fscid,
           info.standby_for_rank};
+
+        // It is possible that the map contains a standby_for_fscid
+        // that doesn't correspond to an existing filesystem, especially
+        // if we loaded from a version with a bug (#17466)
+        if (info.standby_for_fscid != FS_CLUSTER_ID_NONE
+            && !pending_fsmap.filesystem_exists(info.standby_for_fscid)) {
+          derr << "gid " << gid << " has invalid standby_for_fscid "
+               << info.standby_for_fscid << dendl;
+          continue;
+        }
 
         // If we managed to resolve a full target role
         if (target_role.fscid != FS_CLUSTER_ID_NONE) {

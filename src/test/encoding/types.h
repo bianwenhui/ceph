@@ -43,7 +43,7 @@ TYPE_FEATUREFUL_STRAYDATA(OSDMap)
 TYPE_FEATUREFUL_STRAYDATA(OSDMap::Incremental)
 
 #include "crush/CrushWrapper.h"
-TYPE_NOCOPY(CrushWrapper)
+TYPE_FEATUREFUL_NOCOPY(CrushWrapper)
 
 #include "common/histogram.h"
 TYPE(pow2_hist_t)
@@ -379,6 +379,7 @@ TYPE(cls_lock_get_info_op)
 TYPE(cls_lock_get_info_reply)
 TYPE(cls_lock_list_locks_reply)
 TYPE(cls_lock_assert_op)
+TYPE(cls_lock_set_cookie_op)
 
 #include "cls/replica_log/cls_replica_log_types.h"
 TYPE(cls_replica_log_item_marker)

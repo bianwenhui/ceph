@@ -847,6 +847,7 @@ public:
   void remove_want_pg_temp(pg_t pgid);
   void requeue_pg_temp();
   void send_pg_temp();
+  bool is_recovery_active();
 
   void queue_for_peering(PG *pg);
   bool queue_for_recovery(PG *pg);
@@ -861,6 +862,15 @@ public:
 	  ceph_clock_now(cct),
 	  entity_inst_t())));
   }
+
+  Mutex snap_sleep_lock;
+  SafeTimer snap_sleep_timer;
+
+  Mutex scrub_sleep_lock;
+  SafeTimer scrub_sleep_timer;
+
+  AsyncReserver<spg_t> snap_reserver;
+
   void queue_for_scrub(PG *pg) {
     op_wq.queue(
       make_pair(
@@ -868,7 +878,7 @@ public:
 	PGQueueable(
 	  PGScrub(pg->get_osdmap()->get_epoch()),
 	  cct->_conf->osd_scrub_cost,
-	  pg->get_scrub_priority(),
+	  pg->scrubber.priority,
 	  ceph_clock_now(cct),
 	  entity_inst_t())));
   }
@@ -1598,6 +1608,20 @@ public:
   struct HeartbeatDispatcher : public Dispatcher {
     OSD *osd;
     explicit HeartbeatDispatcher(OSD *o) : Dispatcher(o->cct), osd(o) {}
+
+    bool ms_can_fast_dispatch_any() const { return true; }
+    bool ms_can_fast_dispatch(Message *m) const {
+      switch (m->get_type()) {
+	case CEPH_MSG_PING:
+	case MSG_OSD_PING:
+          return true;
+	default:
+          return false;
+	}
+    }
+    void ms_fast_dispatch(Message *m) {
+      osd->heartbeat_dispatch(m);
+    }
     bool ms_dispatch(Message *m) {
       return osd->heartbeat_dispatch(m);
     }
@@ -1607,7 +1631,8 @@ public:
     void ms_handle_remote_reset(Connection *con) {}
     bool ms_verify_authorizer(Connection *con, int peer_type,
 			      int protocol, bufferlist& authorizer_data, bufferlist& authorizer_reply,
-			      bool& isvalid, CryptoKey& session_key) {
+			      bool& isvalid, CryptoKey& session_key,
+			      std::unique_ptr<AuthAuthorizerChallenge> *challenge) override {
       isvalid = true;
       return true;
     }
@@ -1935,6 +1960,10 @@ protected:
   bool  _have_pg(spg_t pgid);
   PG   *_lookup_lock_pg_with_map_lock_held(spg_t pgid);
   PG   *_lookup_lock_pg(spg_t pgid);
+public:
+  PG   *lookup_lock_pg(spg_t pgid);
+
+protected:
   PG   *_lookup_pg(spg_t pgid);
   PG   *_open_lock_pg(OSDMapRef createmap,
 		      spg_t pg, bool no_lockdep_check=false);
@@ -2351,12 +2380,13 @@ protected:
   bool ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer, bool force_new);
   bool ms_verify_authorizer(Connection *con, int peer_type,
 			    int protocol, bufferlist& authorizer, bufferlist& authorizer_reply,
-			    bool& isvalid, CryptoKey& session_key);
-  void ms_handle_connect(Connection *con);
-  void ms_handle_fast_connect(Connection *con);
-  void ms_handle_fast_accept(Connection *con);
-  bool ms_handle_reset(Connection *con);
-  void ms_handle_remote_reset(Connection *con) {}
+			    bool& isvalid, CryptoKey& session_key,
+			    std::unique_ptr<AuthAuthorizerChallenge> *challenge) override;
+  void ms_handle_connect(Connection *con) override;
+  void ms_handle_fast_connect(Connection *con) override;
+  void ms_handle_fast_accept(Connection *con) override;
+  bool ms_handle_reset(Connection *con) override;
+  void ms_handle_remote_reset(Connection *con) override {}
 
   io_queue get_io_queue() const {
     if (cct->_conf->osd_op_queue == "debug_random") {

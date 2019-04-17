@@ -64,14 +64,20 @@ bool RenameRequest<I>::should_complete(int r) {
   CephContext *cct = image_ctx.cct;
   ldout(cct, 5) << this << " " << __func__ << ": state=" << m_state << ", "
                 << "r=" << r << dendl;
-  r = filter_state_return_code(r);
+  r = filter_return_code(r);
   if (r < 0) {
-    lderr(cct) << "encountered error: " << cpp_strerror(r) << dendl;
+    if (r == -EEXIST) {
+      ldout(cct, 1) << "image already exists" << dendl;
+    } else {
+      lderr(cct) << "encountered error: " << cpp_strerror(r) << dendl;
+    }
     return true;
   }
 
-  if (m_state == STATE_REMOVE_SOURCE_HEADER) {
+  if (m_state == STATE_UPDATE_DIRECTORY) {
+    // update in-memory name before removing source header
     apply();
+  } else if (m_state == STATE_REMOVE_SOURCE_HEADER) {
     return true;
   }
 
@@ -94,11 +100,17 @@ bool RenameRequest<I>::should_complete(int r) {
 }
 
 template <typename I>
-int RenameRequest<I>::filter_state_return_code(int r) {
+int RenameRequest<I>::filter_return_code(int r) const {
   I &image_ctx = this->m_image_ctx;
   CephContext *cct = image_ctx.cct;
 
-  if (m_state == STATE_REMOVE_SOURCE_HEADER && r < 0) {
+  if (m_state == STATE_READ_SOURCE_HEADER && r == -ENOENT) {
+    RWLock::RLocker snap_locker(image_ctx.snap_lock);
+    if (image_ctx.name == m_dest_name) {
+      // signal that replay raced with itself
+      return -EEXIST;
+    }
+  } else if (m_state == STATE_REMOVE_SOURCE_HEADER && r < 0) {
     if (r != -ENOENT) {
       lderr(cct) << "warning: couldn't remove old source object ("
                  << m_source_oid << ")" << dendl;

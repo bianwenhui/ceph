@@ -30,6 +30,7 @@
       import-diff                 Import an incremental diff.
       info                        Show information about image size, striping,
                                   etc.
+      journal client disconnect   Flag image journal client as disconnected.
       journal export              Export image journal.
       journal import              Import image journal.
       journal info                Show information about image journal.
@@ -546,6 +547,24 @@
     --format arg          output format [plain, json, or xml]
     --pretty-format       pretty formatting (json and xml)
   
+  rbd help journal client disconnect
+  usage: rbd journal client disconnect [--pool <pool>] [--image <image>] 
+                                       [--journal <journal>] 
+                                       [--client-id <client-id>] 
+                                       <journal-spec> 
+  
+  Flag image journal client as disconnected.
+  
+  Positional arguments
+    <journal-spec>       journal specification
+                         (example: [<pool-name>/]<journal-name>)
+  
+  Optional arguments
+    -p [ --pool ] arg    pool name
+    --image arg          image name
+    --journal arg        journal name
+    --client-id arg      client ID (or leave unspecified to disconnect all)
+  
   rbd help journal export
   usage: rbd journal export [--pool <pool>] [--image <image>] 
                             [--journal <journal>] [--path <path>] [--verbose] 
@@ -738,8 +757,8 @@
     -p [ --pool ] arg     pool name
     --image arg           image name
     --snap arg            snapshot name
-    -o [ --options ] arg  mapping options
-    --read-only           mount read-only
+    -o [ --options ] arg  map options
+    --read-only           map read-only
   
   rbd help merge-diff
   usage: rbd merge-diff [--path <path>] [--no-progress] 
@@ -954,7 +973,8 @@
   
   rbd help nbd map
   usage: rbd nbd map [--pool <pool>] [--image <image>] [--snap <snap>] 
-                     [--read-only] [--device <device>] 
+                     [--read-only] [--device <device>] [--nbds_max <nbds_max>] 
+                     [--max_part <max_part>] 
                      <image-or-snap-spec> 
   
   Map image to a nbd device.
@@ -969,6 +989,8 @@
     --snap arg            snapshot name
     --read-only           mount read-only
     --device arg          specify nbd device
+    --nbds_max arg        override module param nbds_max
+    --max_part arg        override module param max_part
   
   rbd help nbd unmap
   usage: rbd nbd unmap 
@@ -1207,6 +1229,7 @@
   
   rbd help unmap
   usage: rbd unmap [--pool <pool>] [--image <image>] [--snap <snap>] 
+                   [--options <options>] 
                    <image-or-snap-or-device-spec> 
   
   Unmap a rbd device that was used by the kernel.
@@ -1220,6 +1243,7 @@
     -p [ --pool ] arg               pool name
     --image arg                     image name
     --snap arg                      snapshot name
+    -o [ --options ] arg            unmap options
   
   rbd help watch
   usage: rbd watch [--pool <pool>] [--image <image>] 

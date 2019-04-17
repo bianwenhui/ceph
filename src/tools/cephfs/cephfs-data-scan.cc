@@ -14,7 +14,8 @@ int main(int argc, const char **argv)
   argv_to_vec(argc, argv, args);
   env_to_vec(args);
 
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
+  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+                         CODE_ENVIRONMENT_UTILITY, 0);
   common_init_finish(g_ceph_context);
 
   DataScan data_scan;
@@ -38,7 +39,6 @@ int main(int argc, const char **argv)
     std::cerr << "Error (" << cpp_strerror(rc) << ")" << std::endl;
   }
 
-  data_scan.shutdown();
 
   return rc;
 }

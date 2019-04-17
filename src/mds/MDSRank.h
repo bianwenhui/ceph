@@ -19,6 +19,8 @@
 #include "common/LogClient.h"
 #include "common/Timer.h"
 
+#include "messages/MCommand.h"
+
 #include "Beacon.h"
 #include "DamageTable.h"
 #include "MDSMap.h"
@@ -168,6 +170,7 @@ class MDSRank {
     Session *get_session(client_t client) {
       return sessionmap.get_session(entity_name_t::CLIENT(client.v));
     }
+    Session *get_session(Message *m);
 
     PerfCounters       *logger, *mlogger;
     OpTracker    op_tracker;
@@ -223,7 +226,6 @@ class MDSRank {
     bool _dispatch(Message *m, bool new_msg);
 
     ceph::heartbeat_handle_d *hb;  // Heartbeat for threads using mds_lock
-    void heartbeat_reset();
 
     bool is_stale_message(Message *m);
 
@@ -288,6 +290,12 @@ class MDSRank {
     void suicide();
     void respawn();
     // <<<
+
+    /**
+     * Call this periodically if inside a potentially long running piece
+     * of code while holding the mds_lock
+     */
+    void heartbeat_reset();
 
     /**
      * Report state DAMAGED to the mon, and then pass on to respawn().  Call
@@ -445,6 +453,8 @@ class MDSRank {
     void active_start();
     void stopping_start();
     void stopping_done();
+
+    void validate_sessions();
     // <<<
     
     // >>>
@@ -486,21 +496,20 @@ public:
                            Formatter *f, std::ostream& ss);
   void handle_mds_map(MMDSMap *m, MDSMap *oldmap);
   void handle_osd_map();
-  bool kill_session(int64_t session_id);
+  bool kill_session(int64_t session_id, bool wait, std::stringstream& ss);
   void update_log_config();
   bool handle_command_legacy(std::vector<std::string> args);
 
   bool handle_command(
     const cmdmap_t &cmdmap,
-    bufferlist const &inbl,
+    MCommand *m,
     int *r,
     std::stringstream *ds,
-    std::stringstream *ss);
+    std::stringstream *ss,
+    bool *need_reply);
 
-  void dump_sessions(
-      const SessionFilter &filter, Formatter *f) const;
-  std::vector<entity_name_t> evict_sessions(
-      const SessionFilter &filter);
+  void dump_sessions(const SessionFilter &filter, Formatter *f) const;
+  void evict_sessions(const SessionFilter &filter, MCommand *m);
 
   // Call into me from MDS::ms_dispatch
   bool ms_dispatch(Message *m);

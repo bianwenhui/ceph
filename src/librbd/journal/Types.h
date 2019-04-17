@@ -35,7 +35,7 @@ enum EventType {
   EVENT_TYPE_RENAME         = 10,
   EVENT_TYPE_RESIZE         = 11,
   EVENT_TYPE_FLATTEN        = 12,
-  EVENT_TYPE_DEMOTE         = 13
+  EVENT_TYPE_DEMOTE_PROMOTE = 13
 };
 
 struct AioDiscardEvent {
@@ -161,12 +161,15 @@ struct SnapRenameEvent : public SnapEventBase {
   static const EventType TYPE = EVENT_TYPE_SNAP_RENAME;
 
   uint64_t snap_id;
+  std::string src_snap_name;
 
   SnapRenameEvent() : snap_id(CEPH_NOSNAP) {
   }
   SnapRenameEvent(uint64_t op_tid, uint64_t src_snap_id,
+                  const std::string &src_snap_name,
                   const std::string &dest_snap_name)
-    : SnapEventBase(op_tid, dest_snap_name), snap_id(src_snap_id) {
+    : SnapEventBase(op_tid, dest_snap_name), snap_id(src_snap_id),
+      src_snap_name(src_snap_name) {
   }
 
   void encode(bufferlist& bl) const;
@@ -261,8 +264,9 @@ struct FlattenEvent : public OpEventBase {
   using OpEventBase::dump;
 };
 
-struct DemoteEvent {
-  static const EventType TYPE = static_cast<EventType>(EVENT_TYPE_DEMOTE);
+struct DemotePromoteEvent {
+  static const EventType TYPE = static_cast<EventType>(
+    EVENT_TYPE_DEMOTE_PROMOTE);
 
   void encode(bufferlist& bl) const;
   void decode(__u8 version, bufferlist::iterator& it);
@@ -290,7 +294,7 @@ typedef boost::variant<AioDiscardEvent,
                        RenameEvent,
                        ResizeEvent,
                        FlattenEvent,
-                       DemoteEvent,
+                       DemotePromoteEvent,
                        UnknownEvent> Event;
 
 struct EventEntry {
@@ -443,15 +447,38 @@ struct ClientData {
 
 // Journal Tag data structures
 
+struct TagPredecessor {
+  std::string mirror_uuid; // empty if local
+  bool commit_valid = false;
+  uint64_t tag_tid = 0;
+  uint64_t entry_tid = 0;
+
+  TagPredecessor() {
+  }
+  TagPredecessor(const std::string &mirror_uuid, bool commit_valid,
+                 uint64_t tag_tid, uint64_t entry_tid)
+    : mirror_uuid(mirror_uuid), commit_valid(commit_valid), tag_tid(tag_tid),
+      entry_tid(entry_tid) {
+  }
+
+  inline bool operator==(const TagPredecessor &rhs) const {
+    return (mirror_uuid == rhs.mirror_uuid &&
+            commit_valid == rhs.commit_valid &&
+            tag_tid == rhs.tag_tid &&
+            entry_tid == rhs.entry_tid);
+  }
+
+  void encode(bufferlist& bl) const;
+  void decode(bufferlist::iterator& it);
+  void dump(Formatter *f) const;
+};
+
 struct TagData {
   // owner of the tag (exclusive lock epoch)
   std::string mirror_uuid; // empty if local
 
   // mapping to last committed record of previous tag
-  std::string predecessor_mirror_uuid; // empty if local
-  bool predecessor_commit_valid = false;
-  uint64_t predecessor_tag_tid = 0;
-  uint64_t predecessor_entry_tid = 0;
+  TagPredecessor predecessor;
 
   TagData() {
   }
@@ -462,10 +489,8 @@ struct TagData {
           bool predecessor_commit_valid,
           uint64_t predecessor_tag_tid, uint64_t predecessor_entry_tid)
     : mirror_uuid(mirror_uuid),
-      predecessor_mirror_uuid(predecessor_mirror_uuid),
-      predecessor_commit_valid(predecessor_commit_valid),
-      predecessor_tag_tid(predecessor_tag_tid),
-      predecessor_entry_tid(predecessor_entry_tid) {
+      predecessor(predecessor_mirror_uuid, predecessor_commit_valid,
+                  predecessor_tag_tid, predecessor_entry_tid) {
   }
 
   void encode(bufferlist& bl) const;
@@ -481,7 +506,22 @@ std::ostream &operator<<(std::ostream &out, const ImageClientMeta &meta);
 std::ostream &operator<<(std::ostream &out, const MirrorPeerSyncPoint &sync);
 std::ostream &operator<<(std::ostream &out, const MirrorPeerState &meta);
 std::ostream &operator<<(std::ostream &out, const MirrorPeerClientMeta &meta);
+std::ostream &operator<<(std::ostream &out, const TagPredecessor &predecessor);
 std::ostream &operator<<(std::ostream &out, const TagData &tag_data);
+
+struct Listener {
+  virtual ~Listener() {
+  }
+
+  /// invoked when journal close is requested
+  virtual void handle_close() = 0;
+
+  /// invoked when journal is promoted to primary
+  virtual void handle_promoted() = 0;
+
+  /// invoked when journal resync is requested
+  virtual void handle_resync() = 0;
+};
 
 } // namespace journal
 } // namespace librbd

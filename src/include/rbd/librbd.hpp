@@ -176,6 +176,15 @@ private:
   rbd_image_options_t opts;
 };
 
+class CEPH_RBD_API UpdateWatchCtx {
+public:
+  virtual ~UpdateWatchCtx() {}
+  /**
+   * Callback activated when we receive a notify event.
+   */
+  virtual void handle_notify() = 0;
+};
+
 class CEPH_RBD_API Image
 {
 public:
@@ -188,6 +197,9 @@ public:
   int resize(uint64_t size);
   int resize_with_progress(uint64_t size, ProgressContext& pctx);
   int stat(image_info_t &info, size_t infosize);
+  int get_id(std::string *id);
+  std::string get_block_name_prefix();
+  int64_t get_data_pool_id();
   int parent_info(std::string *parent_poolname, std::string *parent_name,
 		      std::string *parent_snapname);
   int old_format(uint8_t *old);
@@ -200,6 +212,11 @@ public:
 
   /* exclusive lock feature */
   int is_exclusive_lock_owner(bool *is_owner);
+  int lock_acquire(rbd_lock_mode_t lock_mode);
+  int lock_release();
+  int lock_get_owners(rbd_lock_mode_t *lock_mode,
+                      std::list<std::string> *lock_owners);
+  int lock_break(rbd_lock_mode_t lock_mode, const std::string &lock_owner);
 
   /* object map feature */
   int rebuild_object_map(ProgressContext &prog_ctx);
@@ -355,6 +372,9 @@ public:
                             size_t info_size);
   int mirror_image_get_status(mirror_image_status_t *mirror_image_status,
 			      size_t status_size);
+
+  int update_watch(UpdateWatchCtx *ctx, uint64_t *handle);
+  int update_unwatch(uint64_t handle);
 
 private:
   friend class RBD;

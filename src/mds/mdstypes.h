@@ -90,13 +90,14 @@ extern const mds_rank_t MDS_RANK_NONE;
 class mds_role_t
 {
   public:
-  mds_rank_t rank;
   fs_cluster_id_t fscid;
+  mds_rank_t rank;
+
   mds_role_t(fs_cluster_id_t fscid_, mds_rank_t rank_)
-    : rank(rank_), fscid(fscid_)
+    : fscid(fscid_), rank(rank_)
   {}
   mds_role_t()
-    : rank(MDS_RANK_NONE), fscid(FS_CLUSTER_ID_NONE)
+    : fscid(FS_CLUSTER_ID_NONE), rank(MDS_RANK_NONE)
   {}
   bool operator<(mds_role_t const &rhs) const
   {
@@ -1345,6 +1346,7 @@ class MDSCacheObject {
 
 
   // -- wait --
+  const static uint64_t WAIT_ORDERED	 = (1ull<<61);
   const static uint64_t WAIT_SINGLEAUTH  = (1ull<<60);
   const static uint64_t WAIT_UNFREEZE    = (1ull<<59); // pka AUTHPINNABLE
 
@@ -1553,7 +1555,8 @@ protected:
   // ---------------------------------------------
   // waiting
  protected:
-  compact_multimap<uint64_t, MDSInternalContextBase*>  waiting;
+  compact_multimap<uint64_t, pair<uint64_t, MDSInternalContextBase*> > waiting;
+  static uint64_t last_wait_seq;
 
  public:
   bool is_waiter_for(uint64_t mask, uint64_t min=0) {
@@ -1562,7 +1565,7 @@ protected:
       while (min & (min-1))  // if more than one bit is set
 	min &= min-1;        //  clear LSB
     }
-    for (compact_multimap<uint64_t,MDSInternalContextBase*>::iterator p = waiting.lower_bound(min);
+    for (auto p = waiting.lower_bound(min);
 	 p != waiting.end();
 	 ++p) {
       if (p->first & mask) return true;
@@ -1573,7 +1576,15 @@ protected:
   virtual void add_waiter(uint64_t mask, MDSInternalContextBase *c) {
     if (waiting.empty())
       get(PIN_WAITER);
-    waiting.insert(pair<uint64_t,MDSInternalContextBase*>(mask, c));
+
+    uint64_t seq = 0;
+    if (mask & WAIT_ORDERED) {
+      seq = ++last_wait_seq;
+      mask &= ~WAIT_ORDERED;
+    }
+    waiting.insert(pair<uint64_t, pair<uint64_t, MDSInternalContextBase*> >(
+			    mask,
+			    pair<uint64_t, MDSInternalContextBase*>(seq, c)));
 //    pdout(10,g_conf->debug_mds) << (mdsco_db_line_prefix(this)) 
 //			       << "add_waiter " << hex << mask << dec << " " << c
 //			       << " on " << *this
@@ -1582,10 +1593,18 @@ protected:
   }
   virtual void take_waiting(uint64_t mask, list<MDSInternalContextBase*>& ls) {
     if (waiting.empty()) return;
-    compact_multimap<uint64_t,MDSInternalContextBase*>::iterator it = waiting.begin();
-    while (it != waiting.end()) {
+
+    // process ordered waiters in the same order that they were added.
+    std::map<uint64_t, MDSInternalContextBase*> ordered_waiters;
+
+    for (auto it = waiting.begin();
+	 it != waiting.end(); ) {
       if (it->first & mask) {
-	ls.push_back(it->second);
+
+	if (it->second.first > 0)
+	  ordered_waiters.insert(it->second);
+	else
+	  ls.push_back(it->second.second);
 //	pdout(10,g_conf->debug_mds) << (mdsco_db_line_prefix(this))
 //				   << "take_waiting mask " << hex << mask << dec << " took " << it->second
 //				   << " tag " << hex << it->first << dec
@@ -1599,6 +1618,11 @@ protected:
 //				   << dendl;
 	++it;
       }
+    }
+    for (auto it = ordered_waiters.begin();
+	 it != ordered_waiters.end();
+	 ++it) {
+      ls.push_back(it->second);
     }
     if (waiting.empty())
       put(PIN_WAITER);

@@ -22,6 +22,7 @@ check_SCRIPTS += ceph-detect-init/run-tox.sh
 
 EXTRA_DIST += \
 	ceph-detect-init/AUTHORS.rst \
+	ceph-detect-init/CMakeLists.txt \
 	ceph-detect-init/ceph_detect_init/centos/__init__.py \
 	ceph-detect-init/ceph_detect_init/exc.py \
 	ceph-detect-init/ceph_detect_init/main.py \
@@ -58,7 +59,7 @@ export CEPH_DETECT_INIT_VIRTUALENV = ${CEPH_BUILD_VIRTUALENV}/ceph-detect-init-v
 ceph-detect-init-all: ${CEPH_DETECT_INIT_VIRTUALENV}
 
 ${CEPH_DETECT_INIT_VIRTUALENV}:
-	cd $(srcdir)/ceph-detect-init ; ../tools/setup-virtualenv.sh ${CEPH_DETECT_INIT_VIRTUALENV} ; test -d wheelhouse && export NO_INDEX=--no-index ; ${CEPH_DETECT_INIT_VIRTUALENV}/bin/pip install $$NO_INDEX --use-wheel --find-links=file://$$(pwd)/wheelhouse -e .
+	cd $(srcdir)/ceph-detect-init ; ../tools/setup-virtualenv.sh ${CEPH_DETECT_INIT_VIRTUALENV} ; test -d wheelhouse && export NO_INDEX=--no-index ; ${CEPH_DETECT_INIT_VIRTUALENV}/bin/pip install $$NO_INDEX --find-links=file://$$(pwd)/wheelhouse -e .
 
 ceph-detect-init-clean:
 	cd $(srcdir)/ceph-detect-init ; python setup.py clean ; rm -fr wheelhouse .tox build ${CEPH_DETECT_INIT_VIRTUALENV} .coverage *.egg-info

@@ -358,12 +358,14 @@ void Objecter::init()
 /*
  * ok, cluster interaction can happen
  */
-void Objecter::start()
+void Objecter::start(const OSDMap* o)
 {
   shared_lock rl(rwlock);
 
   start_tick();
-  if (osdmap->get_epoch() == 0) {
+  if (o) {
+    osdmap->deepish_copy_from(*o);
+  } else if (osdmap->get_epoch() == 0) {
     _maybe_request_map();
   }
 }
@@ -558,6 +560,10 @@ void Objecter::_linger_commit(LingerOp *info, int r, bufferlist& outbl)
   if (info->on_reg_commit) {
     info->on_reg_commit->complete(r);
     info->on_reg_commit = NULL;
+  }
+  if (r < 0 && info->on_notify_finish) {
+    info->on_notify_finish->complete(r);
+    info->on_notify_finish = nullptr;
   }
 
   // only tell the user the first time we do this
@@ -1524,8 +1530,14 @@ void Objecter::_check_linger_pool_dne(LingerOp *op, bool *need_unregister)
   }
   if (op->map_dne_bound > 0) {
     if (osdmap->get_epoch() >= op->map_dne_bound) {
+      LingerOp::unique_lock wl{op->watch_lock};
       if (op->on_reg_commit) {
 	op->on_reg_commit->complete(-ENOENT);
+	op->on_reg_commit = nullptr;
+      }
+      if (op->on_notify_finish) {
+        op->on_notify_finish->complete(-ENOENT);
+        op->on_notify_finish = nullptr;
       }
       *need_unregister = true;
     }
@@ -2287,8 +2299,13 @@ void Objecter::_op_submit(Op *op, shunique_lock& sul, ceph_tid_t *ptid)
 
   bool need_send = false;
 
-  if ((op->target.flags & CEPH_OSD_FLAG_WRITE) &&
-      osdmap->test_flag(CEPH_OSDMAP_PAUSEWR)) {
+  if (osdmap->get_epoch() < epoch_barrier) {
+    ldout(cct, 10) << " barrier, paused " << op << " tid " << op->tid
+		   << dendl;
+    op->target.paused = true;
+    _maybe_request_map();
+  } else if ((op->target.flags & CEPH_OSD_FLAG_WRITE) &&
+             osdmap->test_flag(CEPH_OSDMAP_PAUSEWR)) {
     ldout(cct, 10) << " paused modify " << op << " tid " << op->tid
 		   << dendl;
     op->target.paused = true;
@@ -2404,6 +2421,16 @@ int Objecter::op_cancel(ceph_tid_t tid, int r)
   ret = _op_cancel(tid, r);
 
   return ret;
+}
+
+int Objecter::op_cancel(const vector<ceph_tid_t>& tids, int r)
+{
+  unique_lock wl(rwlock);
+  ldout(cct,10) << __func__ << " " << tids << dendl;
+  for (auto tid : tids) {
+    _op_cancel(tid, r);
+  }
+  return 0;
 }
 
 int Objecter::_op_cancel(ceph_tid_t tid, int r)

@@ -368,6 +368,9 @@ public:
     const hobject_t &hoid,
     map<string, bufferlist> &attrs
     ) {
+    for (auto& attr : attrs) {
+      attr.second.rebuild();
+    }
     t.setattrs(get_coll(hoid), ghobject_t(hoid), attrs);
   }
   void setattr(
@@ -375,6 +378,7 @@ public:
     const string &attrname,
     bufferlist &bl
     ) {
+    bl.rebuild();
     t.setattr(get_coll(hoid), ghobject_t(hoid), attrname, bl);
   }
   void rmattr(
@@ -804,13 +808,8 @@ void ReplicatedBackend::be_deep_scrub(
     ghobject_t(
       poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard));
   assert(iter);
-  uint64_t keys_scanned = 0;
   for (iter->seek_to_first(); iter->valid() ; iter->next(false)) {
-    if (cct->_conf->osd_scan_list_ping_tp_interval &&
-	(keys_scanned % cct->_conf->osd_scan_list_ping_tp_interval == 0)) {
-      handle.reset_tp_timeout();
-    }
-    ++keys_scanned;
+    handle.reset_tp_timeout();
 
     dout(25) << "CRC key " << iter->key() << " value:\n";
     iter->value().hexdump(*_dout);
@@ -1429,7 +1428,7 @@ void ReplicatedBackend::prepare_pull(
 
   dout(7) << "pull " << soid
 	  << " v " << v
-	  << " on osds " << *p
+	  << " on osds " << q->second
 	  << " from osd." << fromshard
 	  << dendl;
 
@@ -1676,6 +1675,12 @@ void ReplicatedBackend::submit_push_data(
     t->touch(coll, ghobject_t(target_oid));
     t->truncate(coll, ghobject_t(target_oid), recovery_info.size);
     t->omap_setheader(coll, ghobject_t(target_oid), omap_header);
+
+    bufferlist bv = attrs[OI_ATTR];
+    object_info_t oi(bv);
+    t->set_alloc_hint(coll, ghobject_t(target_oid),
+		      oi.expected_object_size,
+		      oi.expected_write_size);
   }
   uint64_t off = 0;
   uint32_t fadvise_flags = CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL;
@@ -1824,7 +1829,11 @@ bool ReplicatedBackend::handle_pull_response(
 		   pop.omap_entries,
 		   t);
 
+  pi.stat.num_keys_recovered += pop.omap_entries.size();
+  pi.stat.num_bytes_recovered += data.length();
+
   if (complete) {
+    pi.stat.num_objects_recovered++;
     to_continue->push_back(hoid);
     get_parent()->on_local_recover(
       hoid, pi.recovery_info, pi.obc, t);
@@ -1981,7 +1990,9 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
 	 iter->valid();
 	 iter->next(false)) {
       if (!out_op->omap_entries.empty() &&
-	  available <= (iter->key().size() + iter->value().length()))
+	  ((cct->_conf->osd_recovery_max_omap_entries_per_chunk > 0 &&
+	    out_op->omap_entries.size() >= cct->_conf->osd_recovery_max_omap_entries_per_chunk) ||
+	   available <= iter->key().size() + iter->value().length()))
 	break;
       out_op->omap_entries.insert(make_pair(iter->key(), iter->value()));
 
@@ -2351,7 +2362,8 @@ void ReplicatedBackend::sub_op_push(OpRequestRef op)
 
 void ReplicatedBackend::_failed_push(pg_shard_t from, const hobject_t &soid)
 {
-  get_parent()->failed_push(from, soid);
+  list<pg_shard_t> fl = { from };
+  get_parent()->failed_push(fl, soid);
   pull_from_peer[from].erase(soid);
   if (pull_from_peer[from].empty())
     pull_from_peer.erase(from);

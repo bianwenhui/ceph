@@ -131,6 +131,12 @@ which are as follows:
 :command:`zone list`
   List all zones set on this cluster.
 
+:command:`sync error list`
+  list sync error.
+
+:command:`sync error trim`
+  trim sync error.
+
 :command:`pool add`
   Add an existing pool for data placement.
 
@@ -413,6 +419,20 @@ Orphans Search Options
 .. option:: --num-shards
 
 	Number of shards to use for keeping the temporary scan info
+
+.. option:: --orphan-stale-secs
+
+        Number of seconds to wait before declaring an object to be an orphan.
+        Default is 86400 (24 hours).
+
+.. option:: --job-id
+
+        Set the job id (for orphans find)
+
+.. option:: --max-concurrent-ios
+
+        Maximum concurrent ios for orphans find.
+        Default is 32.
 
 
 Examples

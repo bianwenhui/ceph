@@ -42,6 +42,8 @@ struct ObjectOperation;
 
 ostream& operator<<(ostream& out, const class CDir& dir);
 class CDir : public MDSCacheObject {
+  friend ostream& operator<<(ostream& out, const class CDir& dir);
+
   /*
    * This class uses a boost::pool to handle allocation. This is *not*
    * thread-safe, so don't do allocations from multiple threads!
@@ -426,6 +428,7 @@ protected:
 
   map_t::iterator begin() { return items.begin(); }
   map_t::iterator end() { return items.end(); }
+  map_t::iterator lower_bound(dentry_key_t key) { return items.lower_bound(key); }
 
   unsigned get_num_head_items() const { return num_head_items; }
   unsigned get_num_head_null() const { return num_head_null; }
@@ -509,6 +512,8 @@ private:
    *             <parent,mds2>       subtree_root     
    */
   mds_authority_t dir_auth;
+
+  std::string get_path() const;
 
  public:
   mds_authority_t authority() const;
@@ -610,8 +615,7 @@ protected:
       bufferlist &bl,
       int pos,
       const std::set<snapid_t> *snaps,
-      bool *force_dirty,
-      list<CInode*> *undef_inodes);
+      bool *force_dirty);
 
   /**
    * Mark this fragment as BADFRAG (common part of go_bad and go_bad_dentry)

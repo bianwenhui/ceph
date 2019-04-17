@@ -978,8 +978,8 @@ void AsyncConnection::process()
 
       case STATE_WAIT:
         {
-          ldout(async_msgr->cct, 20) << __func__ << " enter wait state" << dendl;
-          break;
+          ldout(async_msgr->cct, 1) << __func__ << " enter wait state, failing" << dendl;
+          goto fail;
         }
 
       default:
@@ -1076,9 +1076,12 @@ ssize_t AsyncConnection::_process_connection()
           ldout(async_msgr->cct, 1) << __func__ << " reconnect failed " << dendl;
           goto fail;
         } else if (r > 0) {
+          ldout(async_msgr->cct, 10) << __func__ << " nonblock connect inprogress" << dendl;
+          center->create_file_event(sd, EVENT_WRITABLE, read_handler);
           break;
         }
 
+        center->delete_file_event(sd, EVENT_WRITABLE);
         state = STATE_CONNECTING_WAIT_BANNER;
         break;
       }
@@ -1199,8 +1202,7 @@ ssize_t AsyncConnection::_process_connection()
 
     case STATE_CONNECTING_SEND_CONNECT_MSG:
       {
-        if (!got_bad_auth) {
-          delete authorizer;
+        if (!authorizer) {
           authorizer = async_msgr->get_authorizer(peer_type, false);
         }
         bufferlist bl;
@@ -1281,7 +1283,15 @@ ssize_t AsyncConnection::_process_connection()
           }
 
           authorizer_reply.append(state_buffer, connect_reply.authorizer_len);
-          bufferlist::iterator iter = authorizer_reply.begin();
+
+	  if (connect_reply.tag == CEPH_MSGR_TAG_CHALLENGE_AUTHORIZER) {
+	    ldout(async_msgr->cct,10) << __func__ << " connect got auth challenge" << dendl;
+	    authorizer->add_challenge(async_msgr->cct, authorizer_reply);
+	    state = STATE_CONNECTING_SEND_CONNECT_MSG;
+	    break;
+	  }
+
+          auto iter = authorizer_reply.begin();
           if (authorizer && !authorizer->verify_reply(iter)) {
             ldout(async_msgr->cct, 0) << __func__ << " failed verifying authorize reply" << dendl;
             goto fail;
@@ -1595,21 +1605,21 @@ int AsyncConnection::handle_connect_reply(ceph_msg_connect &connect, ceph_msg_co
   }
   if (reply.tag == CEPH_MSGR_TAG_RETRY_GLOBAL) {
     global_seq = async_msgr->get_global_seq(reply.global_seq);
-    ldout(async_msgr->cct, 10) << __func__ << " connect got RETRY_GLOBAL "
-                         << reply.global_seq << " chose new "
-                         << global_seq << dendl;
+    ldout(async_msgr->cct, 5) << __func__ << " connect got RETRY_GLOBAL "
+                              << reply.global_seq << " chose new "
+                              << global_seq << dendl;
     state = STATE_CONNECTING_SEND_CONNECT_MSG;
   }
   if (reply.tag == CEPH_MSGR_TAG_RETRY_SESSION) {
     assert(reply.connect_seq > connect_seq);
-    ldout(async_msgr->cct, 10) << __func__ << " connect got RETRY_SESSION "
-                               << connect_seq << " -> "
-                               << reply.connect_seq << dendl;
+    ldout(async_msgr->cct, 5) << __func__ << " connect got RETRY_SESSION "
+                              << connect_seq << " -> "
+                              << reply.connect_seq << dendl;
     connect_seq = reply.connect_seq;
     state = STATE_CONNECTING_SEND_CONNECT_MSG;
   }
   if (reply.tag == CEPH_MSGR_TAG_WAIT) {
-    ldout(async_msgr->cct, 3) << __func__ << " connect got WAIT (connection race)" << dendl;
+    ldout(async_msgr->cct, 1) << __func__ << " connect got WAIT (connection race)" << dendl;
     state = STATE_WAIT;
   }
 
@@ -1660,14 +1670,25 @@ ssize_t AsyncConnection::handle_connect_msg(ceph_msg_connect &connect, bufferlis
         ldout(async_msgr->cct, 10) << __func__ << " using cephx, requiring MSG_AUTH feature bit for cluster" << dendl;
         policy.features_required |= CEPH_FEATURE_MSG_AUTH;
       }
+      if (async_msgr->cct->_conf->cephx_require_version >= 2 ||
+	  async_msgr->cct->_conf->cephx_cluster_require_version >= 2) {
+        ldout(async_msgr->cct, 10) << __func__ << " using cephx, requiring cephx v2 feature bit for cluster" << dendl;
+        policy.features_required |= CEPH_FEATURE_CEPHX_V2;
+      }
     } else {
       if (async_msgr->cct->_conf->cephx_require_signatures ||
           async_msgr->cct->_conf->cephx_service_require_signatures) {
         ldout(async_msgr->cct, 10) << __func__ << " using cephx, requiring MSG_AUTH feature bit for service" << dendl;
         policy.features_required |= CEPH_FEATURE_MSG_AUTH;
       }
+      if (async_msgr->cct->_conf->cephx_require_version >= 2 ||
+	  async_msgr->cct->_conf->cephx_service_require_version >= 2) {
+        ldout(async_msgr->cct, 10) << __func__ << " using cephx, requiring cephx v2 feature bit for service" << dendl;
+        policy.features_required |= CEPH_FEATURE_CEPHX_V2;
+      }
     }
   }
+
   uint64_t feat_missing = policy.features_required & ~(uint64_t)connect.features;
   if (feat_missing) {
     ldout(async_msgr->cct, 1) << __func__ << " peer missing required features "
@@ -1675,19 +1696,35 @@ ssize_t AsyncConnection::handle_connect_msg(ceph_msg_connect &connect, bufferlis
     return _reply_accept(CEPH_MSGR_TAG_FEATURES, connect, reply, authorizer_reply);
   }
 
+  lock.Unlock();
+
   bool authorizer_valid;
-  if (!async_msgr->verify_authorizer(this, peer_type, connect.authorizer_protocol, authorizer_bl,
-                               authorizer_reply, authorizer_valid, session_key) || !authorizer_valid) {
-    ldout(async_msgr->cct,0) << __func__ << ": got bad authorizer" << dendl;
+  bool need_challenge = connect.features & CEPH_FEATURE_CEPHX_V2;
+  bool had_challenge = (bool)authorizer_challenge;
+  if (!async_msgr->verify_authorizer(
+	this, peer_type, connect.authorizer_protocol, authorizer_bl,
+	authorizer_reply, authorizer_valid, session_key,
+	need_challenge ? &authorizer_challenge : nullptr) ||
+      !authorizer_valid) {
+    lock.Lock();
+    char tag;
+    if (need_challenge && !had_challenge && authorizer_challenge) {
+      ldout(async_msgr->cct,0) << __func__ << ": challenging authorizer"
+			       << dendl;
+      assert(authorizer_reply.length());
+      tag = CEPH_MSGR_TAG_CHALLENGE_AUTHORIZER;
+    } else {
+      ldout(async_msgr->cct,0) << __func__ << ": got bad authorizer" << dendl;
+      tag = CEPH_MSGR_TAG_BADAUTHORIZER;
+    }
     session_security.reset();
-    return _reply_accept(CEPH_MSGR_TAG_BADAUTHORIZER, connect, reply, authorizer_reply);
+    return _reply_accept(tag, connect, reply, authorizer_reply);
   }
 
   // We've verified the authorizer for this AsyncConnection, so set up the session security structure.  PLR
   ldout(async_msgr->cct, 10) << __func__ << " accept setting up session_security." << dendl;
 
   // existing?
-  lock.Unlock();
   AsyncConnectionRef existing = async_msgr->lookup_conn(peer_addr);
 
   inject_delay();
@@ -1706,8 +1743,15 @@ ssize_t AsyncConnection::handle_connect_msg(ceph_msg_connect &connect, bufferlis
     // connection's lock
     existing->lock.Lock(true);  // skip lockdep check (we are locking a second AsyncConnection here)
 
-    if (existing->replacing || existing->state == STATE_CLOSED) {
-      ldout(async_msgr->cct, 1) << __func__ << " existing racing replace or mark_down happened while replacing."
+    if (existing->state == STATE_CLOSED) {
+      ldout(async_msgr->cct, 1) << __func__ << " existing already closed." << dendl;
+      existing->lock.Unlock();
+      existing = NULL;
+      goto open;
+    }
+
+    if (existing->replacing) {
+      ldout(async_msgr->cct, 1) << __func__ << " existing racing replace happened while replacing."
                                 << " existing_state=" << get_state_name(existing->state) << dendl;
       reply.global_seq = existing->peer_global_seq;
       r = _reply_accept(CEPH_MSGR_TAG_RETRY_GLOBAL, connect, reply, authorizer_reply);
@@ -1878,6 +1922,7 @@ ssize_t AsyncConnection::handle_connect_msg(ceph_msg_connect &connect, bufferlis
       ldout(async_msgr->cct, 0) << __func__ << " reply fault for existing connection." << dendl;
       existing->fault();
     }
+    existing->authorizer_challenge.reset();
 
     ldout(async_msgr->cct, 1) << __func__ << " stop myself to swap existing" << dendl;
     _stop();
@@ -2200,7 +2245,8 @@ void AsyncConnection::fault()
   }
 
   write_lock.Unlock();
-  if (!(state >= STATE_CONNECTING && state < STATE_CONNECTING_READY)) {
+  if (!(state >= STATE_CONNECTING && state < STATE_CONNECTING_READY) &&
+      state != STATE_WAIT) { // STATE_WAIT is coming from STATE_CONNECTING_*
     // policy maybe empty when state is in accept
     if (policy.server) {
       ldout(async_msgr->cct, 0) << __func__ << " server, going to standby" << dendl;
@@ -2211,8 +2257,11 @@ void AsyncConnection::fault()
       state = STATE_CONNECTING;
     }
     backoff = utime_t();
+    center->dispatch_event_external(read_handler);
   } else {
-    if (backoff == utime_t()) {
+    if (state == STATE_WAIT) {
+      backoff.set_from_double(async_msgr->cct->_conf->ms_max_backoff);
+    } else if (backoff == utime_t()) {
       backoff.set_from_double(async_msgr->cct->_conf->ms_initial_backoff);
     } else {
       backoff += backoff;
@@ -2222,11 +2271,10 @@ void AsyncConnection::fault()
 
     state = STATE_CONNECTING;
     ldout(async_msgr->cct, 10) << __func__ << " waiting " << backoff << dendl;
+    // woke up again;
+    register_time_events.insert(center->create_time_event(
+            backoff.to_nsec()/1000, wakeup_handler));
   }
-
-  // woke up again;
-  register_time_events.insert(center->create_time_event(
-          backoff.to_nsec()/1000, wakeup_handler));
 }
 
 void AsyncConnection::was_session_reset()

@@ -35,6 +35,9 @@
 #include "include/assert.h"
 #include "include/str_list.h"
 
+#include "mds/MDSAuthCaps.h"
+#include "osd/OSDCap.h"
+
 #define dout_subsys ceph_subsys_mon
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, mon, get_last_committed())
@@ -44,7 +47,7 @@ static ostream& _prefix(std::ostream *_dout, Monitor *mon, version_t v) {
 		<< ").auth v" << v << " ";
 }
 
-ostream& operator<<(ostream& out, AuthMonitor& pm)
+ostream& operator<<(ostream &out, const AuthMonitor &pm)
 {
   return out << "auth";
 }
@@ -419,6 +422,28 @@ bool AuthMonitor::prep_auth(MonOpRequestRef op, bool paxos_writable)
 	  supported.erase(CEPH_AUTH_CEPHX);
 	}
       }
+    } else if (!m->get_connection()->has_feature(CEPH_FEATURE_CEPHX_V2)) {
+      if (entity_name.get_type() == CEPH_ENTITY_TYPE_MON ||
+	  entity_name.get_type() == CEPH_ENTITY_TYPE_OSD ||
+	  entity_name.get_type() == CEPH_ENTITY_TYPE_MDS) {
+	if (g_conf->cephx_cluster_require_version >= 2 ||
+	    g_conf->cephx_require_version >= 2) {
+	  dout(1) << m->get_source_inst()
+                  << " supports cephx but not v2 and"
+                  << " 'cephx [cluster] require version >= 2';"
+                  << " disallowing cephx" << dendl;
+	  supported.erase(CEPH_AUTH_CEPHX);
+	}
+      } else {
+	if (g_conf->cephx_service_require_version >= 2 ||
+	    g_conf->cephx_require_version >= 2) {
+	  dout(1) << m->get_source_inst()
+                  << " supports cephx but not v2 and"
+                  << " 'cephx [service] require version >= 2';"
+                  << " disallowing cephx" << dendl;
+	  supported.erase(CEPH_AUTH_CEPHX);
+	}
+      }
     }
 
     int type;
@@ -652,11 +677,15 @@ void AuthMonitor::export_keyring(KeyRing& keyring)
   mon->key_server.export_keyring(keyring);
 }
 
-void AuthMonitor::import_keyring(KeyRing& keyring)
+int AuthMonitor::import_keyring(KeyRing& keyring)
 {
   for (map<EntityName, EntityAuth>::iterator p = keyring.get_keys().begin();
        p != keyring.get_keys().end();
        ++p) {
+    if (p->second.caps.empty()) {
+      dout(0) << "import: no caps supplied" << dendl;
+      return -EINVAL;
+    }
     KeyServerData::Incremental auth_inc;
     auth_inc.name = p->first;
     auth_inc.auth = p->second;
@@ -665,6 +694,38 @@ void AuthMonitor::import_keyring(KeyRing& keyring)
     dout(30) << "    " << auth_inc.auth << dendl;
     push_cephx_inc(auth_inc);
   }
+  return 0;
+}
+
+bool AuthMonitor::valid_caps(const vector<string>& caps, ostream *out)
+{
+  for (vector<string>::const_iterator p = caps.begin();
+       p != caps.end(); p += 2) {
+    if ((p+1) == caps.end()) {
+      *out << "cap '" << *p << "' has no value";
+      return false;
+    }
+    if (*p == "mon") {
+      MonCap tmp;
+      if (!tmp.parse(*(p+1), out)) {
+	return false;
+      }
+    } else if (*p == "osd") {
+      OSDCap ocap;
+      if (!ocap.parse(*(p+1), out)) {
+	return false;
+      }
+    } else if (*p == "mds") {
+      MDSAuthCaps mdscap;
+      if (!mdscap.parse(g_ceph_context, *(p+1), out)) {
+	return false;
+      }
+    } else {
+      *out << "unknown cap type '" << *p << "'";
+      return false;
+    }
+  }
+  return true;
 }
 
 bool AuthMonitor::prepare_command(MonOpRequestRef op)
@@ -731,7 +792,13 @@ bool AuthMonitor::prepare_command(MonOpRequestRef op)
       rs = err;
       goto done;
     }
-    import_keyring(keyring);
+    err = import_keyring(keyring);
+    if (err < 0) {
+      ss << "auth import: no caps supplied";
+      getline(ss, rs);
+      mon->reply_command(op, -EINVAL, rs, get_last_committed());
+      return true;
+    }
     ss << "imported keyring";
     getline(ss, rs);
     err = 0;
@@ -760,6 +827,11 @@ bool AuthMonitor::prepare_command(MonOpRequestRef op)
         err = -EINVAL;
         goto done;
       }
+    }
+
+    if (!valid_caps(caps_vec, &ss)) {
+      err = -EINVAL;
+      goto done;
     }
 
     // are we about to have it?
@@ -862,7 +934,7 @@ bool AuthMonitor::prepare_command(MonOpRequestRef op)
 						   get_last_committed() + 1));
     return true;
   } else if ((prefix == "auth get-or-create-key" ||
-	     prefix == "auth get-or-create") &&
+	      prefix == "auth get-or-create") &&
 	     !entity_name.empty()) {
     // auth get-or-create <name> [mon osdcapa osd osdcapb ...]
 

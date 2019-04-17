@@ -1,5 +1,6 @@
 if ENABLE_CLIENT
-
+if WITH_RADOS
+if WITH_RADOSGW
 # inject rgw stuff in the decoder testcase
 DENCODER_SOURCES += \
 	rgw/rgw_dencoder.cc \
@@ -17,9 +18,6 @@ DENCODER_DEPS += -lcurl -lexpat \
 	libcls_user_client.la \
 	libcls_timeindex_client.la \
 	libcls_statelog_client.la
-
-if WITH_RADOS
-if WITH_RADOSGW
 
 librgw_la_SOURCES = \
 	rgw/rgw_acl.cc \
@@ -42,6 +40,7 @@ librgw_la_SOURCES = \
 	rgw/rgw_frontend.cc \
 	rgw/rgw_gc.cc \
 	rgw/rgw_http_client.cc \
+	rgw/rgw_http_client_curl.cc \
 	rgw/rgw_json_enc.cc \
 	rgw/rgw_keystone.cc \
 	rgw/rgw_loadgen.cc \
@@ -116,6 +115,11 @@ LIBRGW_DEPS += \
 	-lfcgi \
 	-ldl
 
+if WITH_OPENLDAP
+LIBRGW_DEPS += \
+        -lldap
+endif
+
 librgw_la_LIBADD = $(LIBRGW_DEPS) \
 	$(PTHREAD_LIBS) $(RESOLV_LIBS) libglobal.la \
 	$(EXTRALIBS)
@@ -133,8 +137,7 @@ libcivetweb_la_SOURCES =  \
 
 libcivetweb_la_CXXFLAGS = ${CIVETWEB_INCLUDE} -fPIC -Woverloaded-virtual \
 	${AM_CXXFLAGS}
-libcivetweb_la_CFLAGS = -I$(srcdir)/civetweb/include ${CIVETWEB_INCLUDE} -fPIC -DNO_SSL_DL
-LIBCIVETWEB_DEPS += -lssl -lcrypto
+libcivetweb_la_CFLAGS = -I$(srcdir)/civetweb/include ${CIVETWEB_INCLUDE} -fPIC $(SONAME_DEFINES)
 
 noinst_LTLIBRARIES += libcivetweb.la
 
@@ -147,9 +150,9 @@ radosgw_SOURCES = \
 	civetweb/src/civetweb.c \
 	rgw/rgw_main.cc
 
-radosgw_CFLAGS = -I$(srcdir)/civetweb/include -fPIC -I$(srcdir)/xxHash
-radosgw_LDADD = $(LIBRGW) $(LIBCIVETWEB) $(LIBCIVETWEB_DEPS) $(LIBRGW_DEPS) $(RESOLV_LIBS) \
-	$(CEPH_GLOBAL)
+radosgw_CFLAGS = -I$(srcdir)/civetweb/include -fPIC -I$(srcdir)/xxHash ${CIVETWEB_INCLUDE} $(SONAME_DEFINES)
+radosgw_LDADD = $(LIBRGW) $(LIBCIVETWEB) $(LIBCIVETWEB_DEPS) $(LIBRGW_DEPS) \
+	$(RESOLV_LIBS) $(CEPH_GLOBAL) $(LIBTCMALLOC)
 bin_PROGRAMS += radosgw
 
 radosgw_admin_SOURCES = rgw/rgw_admin.cc rgw/rgw_orphan.cc
@@ -217,6 +220,7 @@ noinst_HEADERS += \
 	rgw/rgw_os_lib.h \
 	rgw/rgw_orphan.h \
 	rgw/rgw_http_client.h \
+	rgw/rgw_http_client_curl.h \
 	rgw/rgw_swift.h \
 	rgw/rgw_swift_auth.h \
 	rgw/rgw_quota.h \

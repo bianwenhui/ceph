@@ -577,6 +577,34 @@ void MDSDaemon::tick()
   }
 }
 
+void MDSDaemon::send_command_reply(MCommand *m, MDSRank *mds_rank,
+				   int r, bufferlist outbl,
+				   const std::string& outs)
+{
+  Session *session = static_cast<Session *>(m->get_connection()->get_priv());
+  assert(session != NULL);
+  // If someone is using a closed session for sending commands (e.g.
+  // the ceph CLI) then we should feel free to clean up this connection
+  // as soon as we've sent them a response.
+  const bool live_session =
+    session->get_state_seq() > 0 &&
+    mds_rank &&
+    mds_rank->sessionmap.get_session(session->info.inst.name);
+
+  if (!live_session) {
+    // This session only existed to issue commands, so terminate it
+    // as soon as we can.
+    assert(session->is_closed());
+    session->connection->mark_disposable();
+  }
+  session->put();
+
+  MCommandReply *reply = new MCommandReply(r, outs);
+  reply->set_tid(m->get_tid());
+  reply->set_data(outbl);
+  m->get_connection()->send_message(reply);
+}
+
 /* This function DOES put the passed message before returning*/
 void MDSDaemon::handle_command(MCommand *m)
 {
@@ -589,7 +617,7 @@ void MDSDaemon::handle_command(MCommand *m)
   std::string outs;
   bufferlist outbl;
   Context *run_after = NULL;
-
+  bool need_reply = true;
 
   if (!session->auth_caps.allow_all()) {
     dout(1) << __func__
@@ -605,28 +633,13 @@ void MDSDaemon::handle_command(MCommand *m)
     r = -EINVAL;
     outs = ss.str();
   } else {
-    r = _handle_command(cmdmap, m->get_data(), &outbl, &outs, &run_after);
+    r = _handle_command(cmdmap, m, &outbl, &outs, &run_after, &need_reply);
   }
+  session->put();
 
-  // If someone is using a closed session for sending commands (e.g.
-  // the ceph CLI) then we should feel free to clean up this connection
-  // as soon as we've sent them a response.
-  const bool live_session = mds_rank &&
-    mds_rank->sessionmap.get_session(session->info.inst.name) != nullptr
-    && session->get_state_seq() > 0;
-
-  if (!live_session) {
-    // This session only existed to issue commands, so terminate it
-    // as soon as we can.
-    assert(session->is_closed());
-    session->connection->mark_disposable();
-    session->put();
+  if (need_reply) {
+    send_command_reply(m, mds_rank, r, outbl, outs);
   }
-
-  MCommandReply *reply = new MCommandReply(r, outs);
-  reply->set_tid(m->get_tid());
-  reply->set_data(outbl);
-  m->get_connection()->send_message(reply);
 
   if (run_after) {
     run_after->complete(0);
@@ -693,10 +706,11 @@ void MDSDaemon::handle_command(MMonCommand *m)
 
 int MDSDaemon::_handle_command(
     const cmdmap_t &cmdmap,
-    bufferlist const &inbl,
+    MCommand *m,
     bufferlist *outbl,
     std::string *outs,
-    Context **run_later)
+    Context **run_later,
+    bool *need_reply)
 {
   assert(outbl != NULL);
   assert(outs != NULL);
@@ -789,11 +803,9 @@ int MDSDaemon::_handle_command(
     int64_t session_id = 0;
     bool got = cmd_getval(cct, cmdmap, "session_id", session_id);
     assert(got);
-    const bool killed = mds_rank->kill_session(session_id);
-    if (!killed) {
+    bool killed = mds_rank->kill_session(session_id, false, ss);
+    if (!killed)
       r = -ENOENT;
-      ss << "session '" << session_id << "' not found";
-    }
   } else if (prefix == "heap") {
     if (!ceph_using_tcmalloc()) {
       r = -EOPNOTSUPP;
@@ -814,7 +826,8 @@ int MDSDaemon::_handle_command(
   } else {
     // Give MDSRank a shot at the command
     if (mds_rank) {
-      bool handled = mds_rank->handle_command(cmdmap, inbl, &r, &ds, &ss);
+      bool handled = mds_rank->handle_command(cmdmap, m, &r, &ds, &ss,
+					      need_reply);
       if (handled) {
         goto out;
       }
@@ -1101,12 +1114,12 @@ void MDSDaemon::respawn()
   }
   new_argv[orig_argc] = NULL;
 
-  /* Determine the path to our executable, try to read
-   * linux-specific /proc/ path first */
-  char exe_path[PATH_MAX];
-  ssize_t exe_path_bytes = readlink("/proc/self/exe", exe_path,
-				    sizeof(exe_path) - 1);
-  if (exe_path_bytes < 0) {
+  /* Determine the path to our executable, test if Linux /proc/self/exe exists.
+   * This allows us to exec the same executable even if it has since been
+   * unlinked.
+   */
+  char exe_path[PATH_MAX] = "";
+  if (readlink("/proc/self/exe", exe_path, PATH_MAX-1) == -1) {
     /* Print CWD for the user's interest */
     char buf[PATH_MAX];
     char *cwd = getcwd(buf, sizeof(buf));
@@ -1114,9 +1127,10 @@ void MDSDaemon::respawn()
     dout(1) << " cwd " << cwd << dendl;
 
     /* Fall back to a best-effort: just running in our CWD */
-    strncpy(exe_path, orig_argv[0], sizeof(exe_path) - 1);
+    strncpy(exe_path, orig_argv[0], PATH_MAX-1);
   } else {
-    exe_path[exe_path_bytes] = '\0';
+    dout(1) << "respawning with exe " << exe_path << dendl;
+    strcpy(exe_path, "/proc/self/exe");
   }
 
   dout(1) << " exe_path " << exe_path << dendl;
@@ -1281,7 +1295,8 @@ void MDSDaemon::ms_handle_remote_reset(Connection *con)
 
 bool MDSDaemon::ms_verify_authorizer(Connection *con, int peer_type,
 			       int protocol, bufferlist& authorizer_data, bufferlist& authorizer_reply,
-			       bool& is_valid, CryptoKey& session_key)
+				     bool& is_valid, CryptoKey& session_key,
+				     std::unique_ptr<AuthAuthorizerChallenge> *challenge)
 {
   Mutex::Locker l(mds_lock);
   if (stopping) {
@@ -1308,8 +1323,16 @@ bool MDSDaemon::ms_verify_authorizer(Connection *con, int peer_type,
   EntityName name;
   uint64_t global_id;
 
-  is_valid = authorize_handler->verify_authorizer(cct, monc->rotating_secrets,
-						  authorizer_data, authorizer_reply, name, global_id, caps_info, session_key);
+  RotatingKeyRing *keys = monc->rotating_secrets;
+  if (keys) {
+    is_valid = authorize_handler->verify_authorizer(
+      cct, keys,
+      authorizer_data, authorizer_reply, name, global_id, caps_info,
+      session_key, nullptr, challenge);
+  } else {
+    dout(10) << __func__ << " no rotating_keys (yet), denied" << dendl;
+    is_valid = false;
+  }
 
   if (is_valid) {
     entity_name_t n(con->get_peer_type(), global_id);

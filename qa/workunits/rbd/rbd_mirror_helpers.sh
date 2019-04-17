@@ -105,7 +105,29 @@ daemon_pid_file()
 
 testlog()
 {
-    echo $(date '+%F %T') $@ | tee -a "${TEMPDIR}/rbd-mirror.test.log"
+    echo $(date '+%F %T') $@ | tee -a "${TEMPDIR}/rbd-mirror.test.log" >&2
+}
+
+expect_failure()
+{
+    local expected="$1" ; shift
+    local out=${TEMPDIR}/expect_failure.out
+
+    if "$@" > ${out} 2>&1 ; then
+        cat ${out} >&2
+        return 1
+    fi
+
+    if [ -z "${expected}" ]; then
+	return 0
+    fi
+
+    if ! grep -q "${expected}" ${out} ; then
+        cat ${out} >&2
+        return 1
+    fi
+
+    return 0
 }
 
 setup()
@@ -182,6 +204,7 @@ start_mirror()
 	--pid-file=$(daemon_pid_file "${cluster}") \
 	--log-file=${TEMPDIR}/rbd-mirror.${cluster}_daemon.\$cluster.\$pid.log \
 	--admin-socket=${TEMPDIR}/rbd-mirror.${cluster}_daemon.\$cluster.asok \
+	--rbd-mirror-journal-poll-age=1 \
 	--debug-rbd=30 --debug-journaler=30 \
 	--debug-rbd_mirror=30 \
 	--daemonize=true
@@ -380,7 +403,7 @@ get_position()
     local status_log=${TEMPDIR}/${CLUSTER2}-${pool}-${image}.status
     rbd --cluster ${cluster} -p ${pool} journal status --image ${image} |
 	tee ${status_log} >&2
-    sed -nEe 's/^.*\[id='"${id_regexp}"',.*positions=\[\[([^]]*)\],.*$/\1/p' \
+    sed -nEe 's/^.*\[id='"${id_regexp}"',.*positions=\[\[([^]]*)\],.*state=connected.*$/\1/p' \
 	${status_log}
 }
 
@@ -408,14 +431,28 @@ wait_for_replay_complete()
     local cluster=$2
     local pool=$3
     local image=$4
-    local s master_pos mirror_pos
+    local s master_pos mirror_pos last_mirror_pos
+    local master_tag master_entry mirror_tag mirror_entry
 
-    for s in 0.2 0.4 0.8 1.6 2 2 4 4 8 8 16 16 32 32; do
-	sleep ${s}
-	flush "${local_cluster}" "${pool}" "${image}"
-	master_pos=$(get_master_position "${cluster}" "${pool}" "${image}")
-	mirror_pos=$(get_mirror_position "${cluster}" "${pool}" "${image}")
-	test -n "${master_pos}" -a "${master_pos}" = "${mirror_pos}" && return 0
+    while true; do
+        for s in 0.2 0.4 0.8 1.6 2 2 4 4 8 8 16 16 32 32; do
+	    sleep ${s}
+	    flush "${local_cluster}" "${pool}" "${image}"
+	    master_pos=$(get_master_position "${cluster}" "${pool}" "${image}")
+	    mirror_pos=$(get_mirror_position "${cluster}" "${pool}" "${image}")
+	    test -n "${master_pos}" -a "${master_pos}" = "${mirror_pos}" && return 0
+            test "${mirror_pos}" != "${last_mirror_pos}" && break
+        done
+
+        test "${mirror_pos}" = "${last_mirror_pos}" && return 1
+        last_mirror_pos="${mirror_pos}"
+
+        # handle the case where the mirror is ahead of the master
+        master_tag=$(echo "${master_pos}" | grep -Eo "tag_tid=[0-9]*" | cut -d'=' -f 2)
+        mirror_tag=$(echo "${mirror_pos}" | grep -Eo "tag_tid=[0-9]*" | cut -d'=' -f 2)
+        master_entry=$(echo "${master_pos}" | grep -Eo "entry_tid=[0-9]*" | cut -d'=' -f 2)
+        mirror_entry=$(echo "${mirror_pos}" | grep -Eo "entry_tid=[0-9]*" | cut -d'=' -f 2)
+        test "${master_tag}" = "${mirror_tag}" -a ${master_entry} -le ${mirror_entry} && return 0
     done
     return 1
 }
@@ -430,19 +467,51 @@ test_status_in_pool_dir()
 
     local status_log=${TEMPDIR}/${cluster}-${image}.mirror_status
     rbd --cluster ${cluster} -p ${pool} mirror image status ${image} |
-	tee ${status_log}
-    grep "state: .*${state_pattern}" ${status_log}
-    grep "description: .*${description_pattern}" ${status_log}
+	tee ${status_log} >&2
+    grep "state: .*${state_pattern}" ${status_log} || return 1
+    grep "description: .*${description_pattern}" ${status_log} || return 1
 }
 
-create_image()
+wait_for_status_in_pool_dir()
 {
     local cluster=$1
     local pool=$2
     local image=$3
+    local state_pattern=$4
+    local description_pattern=$5
 
-    rbd --cluster ${cluster} -p ${pool} create --size 128 \
-	--image-feature layering,exclusive-lock,journaling ${image}
+    for s in 1 2 4 8 8 8 8 8 8 8 8 16 16; do
+	sleep ${s}
+	test_status_in_pool_dir ${cluster} ${pool} ${image} ${state_pattern} ${description_pattern} && return 0
+    done
+    return 1
+}
+
+create_image()
+{
+    local cluster=$1 ; shift
+    local pool=$1 ; shift
+    local image=$1 ; shift
+    local size=128
+
+    if [ -n "$1" ]; then
+	size=$1
+	shift
+    fi
+
+    rbd --cluster ${cluster} -p ${pool} create --size ${size} \
+	--image-feature layering,exclusive-lock,journaling $@ ${image}
+}
+
+set_image_meta()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local key=$4
+    local val=$5
+
+    rbd --cluster ${cluster} -p ${pool} image-meta set ${image} $key $val
 }
 
 remove_image()
@@ -451,6 +520,7 @@ remove_image()
     local pool=$2
     local image=$3
 
+    rbd --cluster=${cluster} -p ${pool} snap purge ${image}
     rbd --cluster=${cluster} -p ${pool} rm ${image}
 }
 
@@ -480,6 +550,16 @@ clone_image()
 	${clone_pool}/${clone_image} --image-feature layering,exclusive-lock,journaling
 }
 
+disconnect_image()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster ${cluster} -p ${pool} journal client disconnect \
+	--image ${image}
+}
+
 create_snapshot()
 {
     local cluster=$1
@@ -498,6 +578,17 @@ remove_snapshot()
     local snap=$4
 
     rbd --cluster ${cluster} -p ${pool} snap rm ${image}@${snap}
+}
+
+rename_snapshot()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local snap=$4
+    local new_snap=$5
+
+    rbd --cluster ${cluster} -p ${pool} snap rename ${image}@${snap} ${image}@${new_snap}
 }
 
 purge_snapshots()
@@ -551,9 +642,12 @@ write_image()
     local pool=$2
     local image=$3
     local count=$4
+    local size=$5
+
+    test -n "${size}" || size=4096
 
     rbd --cluster ${cluster} -p ${pool} bench-write ${image} \
-	--io-size 4096 --io-threads 1 --io-total $((4096 * count)) \
+	--io-size ${size} --io-threads 1 --io-total $((size * count)) \
 	--io-pattern rand
 }
 
@@ -562,7 +656,7 @@ stress_write_image()
     local cluster=$1
     local pool=$2
     local image=$3
-    local duration=$(awk 'BEGIN {srand(); print int(35 * rand()) + 15}')
+    local duration=$(awk 'BEGIN {srand(); print int(10 * rand()) + 5}')
 
     timeout ${duration}s ceph_test_rbd_mirror_random_write \
 	--cluster ${cluster} ${pool} ${image} \
@@ -599,8 +693,9 @@ promote_image()
     local cluster=$1
     local pool=$2
     local image=$3
+    local force=$4
 
-    rbd --cluster=${cluster} mirror image promote ${pool}/${image}
+    rbd --cluster=${cluster} mirror image promote ${pool}/${image} ${force}
 }
 
 set_pool_mirror_mode()
@@ -636,9 +731,13 @@ test_image_present()
     local pool=$2
     local image=$3
     local test_state=$4
+    local image_id=$5
     local current_state=deleted
+    local current_image_id
 
-    rbd --cluster=${cluster} -p ${pool} ls | grep "^${image}$" &&
+    current_image_id=$(get_image_id ${cluster} ${pool} ${image})
+    test -n "${current_image_id}" &&
+    test -z "${image_id}" -o "${image_id}" = "${current_image_id}" &&
     current_state=present
 
     test "${test_state}" = "${current_state}"
@@ -650,14 +749,43 @@ wait_for_image_present()
     local pool=$2
     local image=$3
     local state=$4
+    local image_id=$5
     local s
+
+    test -n "${image_id}" ||
+    image_id=$(get_image_id ${cluster} ${pool} ${image})
 
     # TODO: add a way to force rbd-mirror to update replayers
     for s in 0.1 1 2 4 8 8 8 8 8 8 8 8 16 16 32 32; do
 	sleep ${s}
-	test_image_present "${cluster}" "${pool}" "${image}" "${state}" && return 0
+	test_image_present \
+            "${cluster}" "${pool}" "${image}" "${state}" "${image_id}" &&
+        return 0
     done
     return 1
+}
+
+get_image_id()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+
+    rbd --cluster=${cluster} -p ${pool} info ${image} |
+	sed -ne 's/^.*block_name_prefix: rbd_data\.//p'
+}
+
+request_resync_image()
+{
+    local cluster=$1
+    local pool=$2
+    local image=$3
+    local image_id_var_name=$4
+
+    eval "${image_id_var_name}='$(get_image_id ${cluster} ${pool} ${image})'"
+    eval 'test -n "$'${image_id_var_name}'"'
+
+    rbd --cluster=${cluster} -p ${pool} mirror image resync ${image}
 }
 
 #

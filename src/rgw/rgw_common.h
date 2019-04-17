@@ -184,6 +184,7 @@ using ceph::crypto::MD5;
 #define ERR_USER_SUSPENDED       2100
 #define ERR_INTERNAL_ERROR       2200
 #define ERR_NOT_IMPLEMENTED      2201
+#define ERR_SERVICE_UNAVAILABLE  2202
 
 #ifndef UINT32_MAX
 #define UINT32_MAX (0xffffffffu)
@@ -390,6 +391,7 @@ enum RGWOpType {
   RGW_OP_STAT_ACCOUNT,
   RGW_OP_LIST_BUCKET,
   RGW_OP_GET_BUCKET_LOGGING,
+  RGW_OP_GET_BUCKET_LOCATION,
   RGW_OP_GET_BUCKET_VERSIONING,
   RGW_OP_SET_BUCKET_VERSIONING,
   RGW_OP_GET_BUCKET_WEBSITE,
@@ -421,9 +423,14 @@ enum RGWOpType {
   RGW_OP_LIST_BUCKET_MULTIPARTS,
   RGW_OP_DELETE_MULTI_OBJ,
   RGW_OP_BULK_DELETE,
+  RGW_OP_SET_ATTRS,
+  RGW_OP_GET_CROSS_DOMAIN_POLICY,
+  RGW_OP_GET_HEALTH_CHECK,
+  RGW_OP_GET_INFO,
 
   /* rgw specific */
-  RGW_OP_ADMIN_SET_METADATA
+  RGW_OP_ADMIN_SET_METADATA,
+  RGW_OP_GET_OBJ_LAYOUT,
 };
 
 class RGWAccessControlPolicy;
@@ -535,7 +542,7 @@ struct RGWUserInfo
   map<string, RGWAccessKey> swift_keys;
   map<string, RGWSubUser> subusers;
   __u8 suspended;
-  uint32_t max_buckets;
+  int32_t max_buckets;
   uint32_t op_mask;
   RGWUserCaps caps;
   __u8 system;
@@ -688,10 +695,15 @@ struct rgw_bucket {
 
   rgw_bucket() { }
   // cppcheck-suppress noExplicitConstructor
-  rgw_bucket(const cls_user_bucket& b) : name(b.name), data_pool(b.data_pool),
-					 data_extra_pool(b.data_extra_pool),
-					 index_pool(b.index_pool), marker(b.marker),
-					 bucket_id(b.bucket_id) {}
+  explicit rgw_bucket(const rgw_user& u, const cls_user_bucket& b)
+    : tenant(u.tenant),
+      name(b.name),
+      data_pool(b.data_pool),
+      data_extra_pool(b.data_extra_pool),
+      index_pool(b.index_pool),
+      marker(b.marker),
+      bucket_id(b.bucket_id) {
+  }
   rgw_bucket(const string& s) : name(s) {
     data_pool = index_pool = s;
     marker = "";
@@ -753,6 +765,10 @@ struct rgw_bucket {
     DECODE_FINISH(bl);
   }
 
+  // format a key for the bucket/instance. pass delim=0 to skip a field
+  std::string get_key(char tenant_delim = '/',
+                      char id_delim = ':') const;
+
   const string& get_data_extra_pool() {
     if (data_extra_pool.empty()) {
       return data_pool;
@@ -797,7 +813,10 @@ struct rgw_bucket_shard {
   int shard_id;
 
   rgw_bucket_shard() : shard_id(-1) {}
-  rgw_bucket_shard(rgw_bucket& _b, int _sid) : bucket(_b), shard_id(_sid) {}
+  rgw_bucket_shard(const rgw_bucket& _b, int _sid) : bucket(_b), shard_id(_sid) {}
+
+  std::string get_key(char tenant_delim = '/', char id_delim = ':',
+                      char shard_delim = ':') const;
 
   bool operator<(const rgw_bucket_shard& b) const {
     if (bucket < b.bucket) {
@@ -992,11 +1011,14 @@ struct RGWBucketInfo
 
   void decode_json(JSONObj *obj);
 
-  bool versioned() { return (flags & BUCKET_VERSIONED) != 0; }
+  bool versioned() const { return (flags & BUCKET_VERSIONED) != 0; }
   int versioning_status() { return flags & (BUCKET_VERSIONED | BUCKET_VERSIONS_SUSPENDED); }
   bool versioning_enabled() { return versioning_status() == BUCKET_VERSIONED; }
 
-  bool has_swift_versioning() { return swift_versioning; }
+  bool has_swift_versioning() const {
+    /* A bucket may be versioned through one mechanism only. */
+    return swift_versioning && !versioned();
+  }
 
   RGWBucketInfo() : flags(0), has_instance_obj(false), num_shards(0), bucket_index_shard_hash_type(MOD), requester_pays(false),
                     has_website(false), swift_versioning(false) {}
@@ -1188,6 +1210,10 @@ struct rgw_aws4_auth {
   string signature;
   string new_signature;
   string payload_hash;
+  string seed_signature;
+  string signing_key;
+  char signing_k[CEPH_CRYPTO_HMACSHA256_DIGESTSIZE];
+  bufferlist bl;
 };
 
 struct req_init_state {
@@ -1260,7 +1286,8 @@ struct req_state {
 
   /* aws4 auth support */
   bool aws4_auth_needs_complete;
-  rgw_aws4_auth *aws4_auth;
+  bool aws4_auth_streaming_mode;
+  unique_ptr<rgw_aws4_auth> aws4_auth;
 
   string canned_acl;
   bool has_acl_header;
@@ -1306,6 +1333,7 @@ struct RGWObjEnt {
   string tag;
   uint32_t flags;
   uint64_t versioned_epoch;
+  string user_data;
 
   RGWObjEnt() : size(0), flags(0), versioned_epoch(0) {}
 
@@ -1332,11 +1360,13 @@ struct RGWBucketEnt {
 
   RGWBucketEnt() : size(0), size_rounded(0), count(0) {}
 
-  explicit RGWBucketEnt(const cls_user_bucket_entry& e) : bucket(e.bucket),
-		  					  size(e.size), 
-			  				  size_rounded(e.size_rounded),
-							  creation_time(e.creation_time),
-							  count(e.count) {}
+  explicit RGWBucketEnt(const rgw_user& u, const cls_user_bucket_entry& e)
+    : bucket(u, e.bucket),
+      size(e.size),
+      size_rounded(e.size_rounded),
+      creation_time(e.creation_time),
+      count(e.count) {
+  }
 
   void convert(cls_user_bucket_entry *b) {
     bucket.convert(&b->bucket);
@@ -1713,13 +1743,16 @@ public:
   bool operator<(const rgw_obj& o) const {
     int r = bucket.name.compare(o.bucket.name);
     if (r == 0) {
-     r = object.compare(o.object);
-     if (r == 0) {
-       r = ns.compare(o.ns);
-       if (r == 0) {
-         r = instance.compare(o.instance);
-       }
-     }
+      r = bucket.bucket_id.compare(o.bucket.bucket_id);
+      if (r == 0) {
+        r = object.compare(o.object);
+        if (r == 0) {
+          r = ns.compare(o.ns);
+          if (r == 0) {
+            r = instance.compare(o.instance);
+          }
+        }
+      }
     }
 
     return (r < 0);
@@ -1875,5 +1908,8 @@ extern void    calc_hash_sha256_update_stream(SHA256 *hash, const char *msg, int
 extern string  calc_hash_sha256_close_stream(SHA256 **hash);
 
 extern int rgw_parse_op_type_list(const string& str, uint32_t *perm);
+
+void rgw_setup_saved_curl_handles();
+void rgw_release_all_curl_handles();
 
 #endif

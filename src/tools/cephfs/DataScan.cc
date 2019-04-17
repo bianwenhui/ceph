@@ -212,8 +212,8 @@ int DataScan::main(const std::vector<const char*> &args)
   // If caller didn't specify a namespace, try to pick
   // one if only one exists
   if (fscid == FS_CLUSTER_ID_NONE) {
-    if (fsmap->get_filesystems().size() == 1) {
-      fscid = fsmap->get_filesystems().begin()->first;
+    if (fsmap->filesystem_count() == 1) {
+      fscid = fsmap->get_filesystem()->fscid;
     } else {
       std::cerr << "Specify a filesystem with --filesystem" << std::endl;
       return -EINVAL;
@@ -350,6 +350,7 @@ int MetadataDriver::inject_unlinked_inode(
   // they don't have to mount the filesystem to correct it?
   inode.inode.layout = file_layout_t::get_default();
   inode.inode.layout.pool_id = data_pool_id;
+  inode.inode.dir_layout.dl_dir_hash = g_conf->mds_default_dir_hash;
 
   // Assume that we will get our stats wrong, and that we may
   // be ignoring dirfrags that exist
@@ -1423,6 +1424,8 @@ int MetadataDriver::inject_with_backtrace(
         // accurate, but it should avoid functional issues.
 
         ancestor_dentry.inode.dirstat.nfiles = 1;
+        ancestor_dentry.inode.dir_layout.dl_dir_hash =
+                                               g_conf->mds_default_dir_hash;
 
         ancestor_dentry.inode.nlink = 1;
         ancestor_dentry.inode.ino = ino;
@@ -1764,6 +1767,7 @@ void MetadataTool::build_dir_dentry(
   out->inode.ctime.tv.tv_sec = fragstat.mtime;
 
   out->inode.layout = layout;
+  out->inode.dir_layout.dl_dir_hash = g_conf->mds_default_dir_hash;
 
   out->inode.truncate_seq = 1;
   out->inode.truncate_size = -1ull;

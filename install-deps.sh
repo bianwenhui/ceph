@@ -19,21 +19,62 @@ if test $(id -u) != 0 ; then
 fi
 export LC_ALL=C # the following is vulnerable to i18n
 
-if test -f /etc/redhat-release ; then
-    $SUDO yum install -y redhat-lsb-core
-fi
+function ensure_decent_gcc_on_deb {
+    # point gcc to the one offered by distro if the used one is different
+    local old=$(gcc -dumpversion)
+    local new=$1
+    if dpkg --compare-versions $old eq $new; then
+	    return
+    fi
 
-if type apt-get > /dev/null 2>&1 ; then
-    $SUDO apt-get install -y lsb-release devscripts equivs
-fi
+    case $old in
+        4*)
+            old=4.8;;
+        5*)
+            old=5;;
+        7*)
+            old=7;;
+    esac
 
-if type zypper > /dev/null 2>&1 ; then
-    $SUDO zypper --gpg-auto-import-keys --non-interactive install lsb-release systemd-rpm-macros
-fi
+    case $- in
+    *i*)
+        # interactive shell
+        cat <<EOF
+/usr/bin/gcc now points to gcc-$old, which is not the version shipped with the
+distro: gcc-$new. Reverting...
+EOF
+    esac
 
-case $(lsb_release -si) in
-Ubuntu|Debian|Devuan)
-        $SUDO apt-get install -y dpkg-dev
+    $SUDO update-alternatives --remove-all gcc || true
+    $SUDO update-alternatives \
+	 --install /usr/bin/gcc gcc /usr/bin/gcc-${new} 20 \
+	 --slave   /usr/bin/g++ g++ /usr/bin/g++-${new}
+
+    $SUDO update-alternatives \
+	 --install /usr/bin/gcc gcc /usr/bin/gcc-${old} 10 \
+	 --slave   /usr/bin/g++ g++ /usr/bin/g++-${old}
+
+    $SUDO update-alternatives --auto gcc
+
+    # cmake uses the latter by default
+    $SUDO ln -nsf /usr/bin/gcc /usr/bin/x86_64-linux-gnu-gcc
+    $SUDO ln -nsf /usr/bin/g++ /usr/bin/x86_64-linux-gnu-g++
+}
+
+source /etc/os-release
+case $ID in
+    debian|ubuntu|devuan)
+        echo "Using apt-get to install dependencies"
+        $SUDO apt-get install -y lsb-release devscripts equivs
+        $SUDO apt-get install -y dpkg-dev gcc
+        case "$VERSION" in
+            *Trusty*)
+                ensure_decent_gcc_on_deb 4.8
+                ;;
+            *Xenial*)
+                ensure_decent_gcc_on_deb 5
+                ;;
+        esac
         if ! test -r debian/control ; then
             echo debian/control is not a readable file
             exit 1
@@ -57,7 +98,9 @@ Ubuntu|Debian|Devuan)
 	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y remove ceph-build-deps
 	if [ -n "$backports" ] ; then rm $control; fi
         ;;
-CentOS|Fedora|RedHatEnterpriseServer)
+    centos|fedora|rhel)
+        echo "Using yum to install dependencies"
+        $SUDO yum install -y redhat-lsb-core
         case $(lsb_release -si) in
             Fedora)
                 $SUDO yum install -y yum-utils
@@ -82,12 +125,14 @@ CentOS|Fedora|RedHatEnterpriseServer)
         $SUDO yum-builddep -y $DIR/ceph.spec 2>&1 | tee $DIR/yum-builddep.out
         ! grep -q -i error: $DIR/yum-builddep.out || exit 1
         ;;
-*SUSE*)
+    opensuse|suse|sles)
+        echo "Using zypper to install dependencies"
+        $SUDO zypper --gpg-auto-import-keys --non-interactive install lsb-release systemd-rpm-macros
         sed -e 's/@//g' < ceph.spec.in > $DIR/ceph.spec
         $SUDO zypper --non-interactive install $(rpmspec -q --buildrequires $DIR/ceph.spec) || exit 1
         ;;
-*)
-        echo "$(lsb_release -si) is unknown, dependencies will have to be installed manually."
+    *)
+        echo "$ID is unknown, dependencies will have to be installed manually."
         ;;
 esac
 

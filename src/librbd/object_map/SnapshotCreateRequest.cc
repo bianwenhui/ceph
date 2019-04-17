@@ -3,7 +3,6 @@
 
 #include "librbd/object_map/SnapshotCreateRequest.h"
 #include "common/dout.h"
-#include "common/errno.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/ObjectMap.h"
 #include "cls/lock/cls_lock_client.h"
@@ -80,7 +79,7 @@ void SnapshotCreateRequest::send_read_map() {
   assert(m_image_ctx.get_snap_info(m_snap_id) != NULL);
 
   CephContext *cct = m_image_ctx.cct;
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, CEPH_NOSNAP));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, CEPH_NOSNAP));
   ldout(cct, 5) << this << " " << __func__ << ": oid=" << oid << dendl;
   m_state = STATE_READ_MAP;
 
@@ -97,7 +96,7 @@ void SnapshotCreateRequest::send_read_map() {
 
 void SnapshotCreateRequest::send_write_map() {
   CephContext *cct = m_image_ctx.cct;
-  std::string snap_oid(ObjectMap::object_map_name(m_image_ctx.id, m_snap_id));
+  std::string snap_oid(ObjectMap<>::object_map_name(m_image_ctx.id, m_snap_id));
   ldout(cct, 5) << this << " " << __func__ << ": snap_oid=" << snap_oid
                 << dendl;
   m_state = STATE_WRITE_MAP;
@@ -118,7 +117,7 @@ bool SnapshotCreateRequest::send_add_snapshot() {
   }
 
   CephContext *cct = m_image_ctx.cct;
-  std::string oid(ObjectMap::object_map_name(m_image_ctx.id, CEPH_NOSNAP));
+  std::string oid(ObjectMap<>::object_map_name(m_image_ctx.id, CEPH_NOSNAP));
   ldout(cct, 5) << this << " " << __func__ << ": oid=" << oid << dendl;
   m_state = STATE_ADD_SNAPSHOT;
 
@@ -136,10 +135,12 @@ bool SnapshotCreateRequest::send_add_snapshot() {
 void SnapshotCreateRequest::update_object_map() {
   RWLock::WLocker snap_locker(m_image_ctx.snap_lock);
   RWLock::WLocker object_map_locker(m_image_ctx.object_map_lock);
-
-  for (uint64_t i = 0; i < m_object_map.size(); ++i) {
-    if (m_object_map[i] == OBJECT_EXISTS) {
-      m_object_map[i] = OBJECT_EXISTS_CLEAN;
+  
+  auto it = m_object_map.begin();
+  auto end_it = m_object_map.end();
+  for (; it != end_it; ++it) {
+    if (*it == OBJECT_EXISTS) {
+      *it = OBJECT_EXISTS_CLEAN;
     }
   }
 }

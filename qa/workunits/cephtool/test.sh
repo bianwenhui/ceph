@@ -470,7 +470,9 @@ function test_tiering()
 
 function test_auth()
 {
-  ceph auth add client.xx mon allow osd "allow *"
+  expect_false ceph auth add client.xx mon 'invalid' osd "allow *"
+  expect_false ceph auth add client.xx mon 'allow *' osd "allow *" invalid "allow *"
+  ceph auth add client.xx mon 'allow *' osd "allow *"
   ceph auth export client.xx >client.xx.keyring
   ceph auth add client.xx -i client.xx.keyring
   rm -f client.xx.keyring
@@ -493,7 +495,7 @@ function test_auth()
   expect_false ceph auth get client.xx
 
   # (almost) interactive mode
-  echo -e 'auth add client.xx mon allow osd "allow *"\n' | ceph
+  echo -e 'auth add client.xx mon "allow *" osd "allow *"\n' | ceph
   ceph auth get client.xx
   # script mode
   echo 'auth del client.xx' | ceph
@@ -504,6 +506,9 @@ function test_auth()
   #
   local auid=444
   ceph-authtool --create-keyring --name client.TEST --gen-key --set-uid $auid TEST-keyring
+  expect_false ceph auth import --in-file TEST-keyring
+  rm TEST-keyring
+  ceph-authtool --create-keyring --name client.TEST --gen-key --cap mon "allow r" --set-uid $auid TEST-keyring
   ceph auth import --in-file TEST-keyring
   rm TEST-keyring
   ceph auth get client.TEST > $TMPFILE
@@ -1081,6 +1086,8 @@ function test_mon_osd()
   ceph osd set sortbitwise  # new backends cant handle nibblewise
   expect_false ceph osd set bogus
   expect_false ceph osd unset bogus
+  ceph osd set require_jewel_osds
+  expect_false ceph osd unset require_jewel_osds
 
   ceph osd set noup
   ceph osd down 0
@@ -1215,7 +1222,7 @@ function test_mon_osd()
   ceph osd pool delete data data --yes-i-really-really-mean-it
 
   ceph osd pause
-  ceph osd dump | grep 'flags pauserd,pausewr'
+  ceph osd dump | grep 'flags.*pauserd,pausewr'
   ceph osd unpause
 
   ceph osd tree
@@ -1418,7 +1425,7 @@ function test_mon_osd_pool_set()
   ceph --format=xml osd pool get $TEST_POOL_GETSET auid | grep $auid
   ceph osd pool set $TEST_POOL_GETSET auid 0
 
-  for flag in hashpspool nodelete nopgchange nosizechange write_fadvise_dontneed noscrub nodeep-scrub; do
+  for flag in nodelete nopgchange nosizechange write_fadvise_dontneed noscrub nodeep-scrub; do
       ceph osd pool set $TEST_POOL_GETSET $flag false
       ceph osd pool get $TEST_POOL_GETSET $flag | grep "$flag: false"
       ceph osd pool set $TEST_POOL_GETSET $flag true
@@ -1482,6 +1489,12 @@ function test_mon_osd_pool_set()
   ceph osd pool set $TEST_POOL_GETSET size 2
   wait_for_clean
   ceph osd pool set $TEST_POOL_GETSET min_size 2
+  
+  expect_false ceph osd pool set $TEST_POOL_GETSET hashpspool 0
+  ceph osd pool set $TEST_POOL_GETSET hashpspool 0 --yes-i-really-mean-it
+  
+  expect_false ceph osd pool set $TEST_POOL_GETSET hashpspool 1
+  ceph osd pool set $TEST_POOL_GETSET hashpspool 1 --yes-i-really-mean-it
 
   ceph osd pool set $TEST_POOL_GETSET nodelete 1
   expect_false ceph osd pool delete $TEST_POOL_GETSET $TEST_POOL_GETSET --yes-i-really-really-mean-it
@@ -1835,6 +1848,18 @@ function test_mon_cephdf_commands()
   expect_false test $cal_raw_used_size != $raw_used_size
 }
 
+function test_mon_stdin_stdout()
+{
+  echo foo | ceph config-key put test_key -i -
+  ceph config-key get test_key -o - | grep -c foo | grep -q 1
+}
+
+function test_osd_compact()
+{
+  ceph tell osd.1 compact
+  $SUDO ceph daemon osd.1 compact
+}
+
 #
 # New tests should be added to the TESTS array below
 #
@@ -1873,9 +1898,12 @@ MON_TESTS+=" mon_crushmap_validation"
 MON_TESTS+=" mon_ping"
 MON_TESTS+=" mon_deprecated_commands"
 MON_TESTS+=" mon_caps"
+MON_TESTS+=" mon_stdin_stdout"
+
 OSD_TESTS+=" osd_bench"
 OSD_TESTS+=" osd_negative_filestore_merge_threshold"
 OSD_TESTS+=" tiering_agent"
+OSD_TESTS+=" osd_compact"
 
 MDS_TESTS+=" mds_tell"
 MDS_TESTS+=" mon_mds"

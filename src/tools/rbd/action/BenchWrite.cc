@@ -118,6 +118,19 @@ int do_bench_write(librbd::Image& image, uint64_t io_size,
                    uint64_t io_threads, uint64_t io_bytes,
                    bool random)
 {
+  uint64_t size = 0;
+  image.size(&size);
+  if (io_size > size) {
+    std::cerr << "rbd: io-size " << prettybyte_t(io_size) << " "
+              << "larger than image size " << prettybyte_t(size) << std::endl;
+    return -EINVAL;
+  }
+
+  if (io_size > std::numeric_limits<uint32_t>::max()) {
+    std::cerr << "rbd: io-size should be less than 4G" << std::endl;
+    return -EINVAL;
+  }
+
   rbd_bencher b(&image);
 
   std::cout << "bench-write "
@@ -137,9 +150,6 @@ int do_bench_write(librbd::Image& image, uint64_t io_size,
   utime_t start = ceph_clock_now(NULL);
   utime_t last;
   unsigned ios = 0;
-
-  uint64_t size = 0;
-  image.size(&size);
 
   vector<uint64_t> thread_offset;
   uint64_t i;

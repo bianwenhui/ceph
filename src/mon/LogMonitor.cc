@@ -46,7 +46,7 @@ static ostream& _prefix(std::ostream *_dout, Monitor *mon, version_t v) {
 		<< ").log v" << v << " ";
 }
 
-ostream& operator<<(ostream& out, LogMonitor& pm)
+ostream& operator<<(ostream &out, const LogMonitor &pm)
 {
   /*
   std::stringstream ss;
@@ -341,6 +341,7 @@ bool LogMonitor::preprocess_log(MonOpRequestRef op)
   return false;
 
  done:
+  mon->no_reply(op);
   return true;
 }
 

@@ -19,10 +19,12 @@
 
 #include "HashIndex.h"
 
+#include "common/errno.h"
 #include "common/debug.h"
 #define dout_subsys ceph_subsys_filestore
 
 const string HashIndex::SUBDIR_ATTR = "contents";
+const string HashIndex::SETTINGS_ATTR = "settings";
 const string HashIndex::IN_PROGRESS_OP_TAG = "in_progress_op";
 
 /// hex digit to integer value
@@ -303,10 +305,103 @@ int HashIndex::_split(
     &mkdirred);
 }
 
+int HashIndex::split_dirs(const vector<string> &path) {
+  dout(20) << __func__ << " " << path << dendl;
+  subdir_info_s info;
+  int r = get_info(path, &info);
+  if (r < 0) {
+    dout(10) << "error looking up info for " << path << ": "
+	     << cpp_strerror(r) << dendl;
+    return r;
+  }
+
+  if (must_split(info)) {
+    dout(1) << __func__ << " " << path << " has " << info.objs
+            << " objects, starting split in pg " << coll() << "." << dendl;
+    r = initiate_split(path, info);
+    if (r < 0) {
+      dout(10) << "error initiating split on " << path << ": "
+	       << cpp_strerror(r) << dendl;
+      return r;
+    }
+
+    r = complete_split(path, info);
+    dout(1) << __func__ << " " << path << " split completed in pg " << coll() << "."
+            << dendl;
+    if (r < 0) {
+      dout(10) << "error completing split on " << path << ": "
+	       << cpp_strerror(r) << dendl;
+      return r;
+    }
+  }
+
+  vector<string> subdirs;
+  r = list_subdirs(path, &subdirs);
+  if (r < 0) {
+    dout(10) << "error listing subdirs of " << path << ": "
+	     << cpp_strerror(r) << dendl;
+    return r;
+  }
+  for (vector<string>::const_iterator it = subdirs.begin();
+       it != subdirs.end(); ++it) {
+    vector<string> subdir_path(path);
+    subdir_path.push_back(*it);
+    r = split_dirs(subdir_path);
+    if (r < 0) {
+      return r;
+    }
+  }
+
+  return r;
+}
+
+int HashIndex::apply_layout_settings() {
+  vector<string> path;
+  dout(10) << __func__ << " split multiple = " << split_multiplier
+	   << " merge threshold = " << merge_threshold
+	   << " split rand factor = " << g_conf->filestore_split_rand_factor
+	   << dendl;
+  int r = write_settings();
+  if (r < 0)
+    return r;
+  return split_dirs(path);
+}
+
 int HashIndex::_init() {
   subdir_info_s info;
   vector<string> path;
-  return set_info(path, info);
+  int r = set_info(path, info);
+  if (r < 0)
+    return r;
+  return write_settings();
+}
+
+int HashIndex::write_settings() {
+  if (g_conf->filestore_split_rand_factor > 0) {
+    settings.split_rand_factor = rand() % g_conf->filestore_split_rand_factor;
+  } else {
+    settings.split_rand_factor = 0;
+  }
+  vector<string> path;
+  bufferlist bl;
+  settings.encode(bl);
+  return add_attr_path(path, SETTINGS_ATTR, bl);
+}
+
+int HashIndex::read_settings() {
+  vector<string> path;
+  bufferlist bl;
+  int r = get_attr_path(path, SETTINGS_ATTR, bl);
+  if (r == -ENODATA)
+    return 0;
+  if (r < 0) {
+    derr << __func__ << " error reading settings: " << cpp_strerror(r) << dendl;
+    return r;
+  }
+  bufferlist::iterator it = bl.begin();
+  settings.decode(it);
+  dout(20) << __func__ << " split_rand_factor = " << settings.split_rand_factor << dendl;
+  return 0;
 }
 
 /* LFNIndex virtual method implementations */
@@ -324,10 +419,15 @@ int HashIndex::_created(const vector<string> &path,
     return r;
 
   if (must_split(info)) {
+    dout(1) << __func__ << " " << path << " has " << info.objs
+            << " objects, starting split in pg " << coll() << "." << dendl;
     int r = initiate_split(path, info);
     if (r < 0)
       return r;
-    return complete_split(path, info);
+    r = complete_split(path, info);
+    dout(1) << __func__ << " " << path << " split completed in pg " << coll() << "."
+            << dendl;
+    return r;
   } else {
     return 0;
   }
@@ -433,7 +533,7 @@ int HashIndex::pre_split_folder(uint32_t pg_num, uint64_t expected_num_objs)
 
   // Calculate the number of leaf folders (which actually store files)
   // need to be created
-  const uint64_t objs_per_folder = (uint64_t)(abs(merge_threshold)) * (uint64_t)split_multiplier * 16;
+  const uint64_t objs_per_folder = ((uint64_t)(abs(merge_threshold)) * (uint64_t)split_multiplier + settings.split_rand_factor) * 16;
   uint64_t leavies = expected_num_objs / objs_per_folder ;
   // No need to split
   if (leavies == 0 || expected_num_objs == objs_per_folder)
@@ -550,7 +650,12 @@ int HashIndex::recursive_create_path(vector<string>& path, int level)
 }
 
 int HashIndex::recursive_remove(const vector<string> &path) {
+  return _recursive_remove(path, true);
+}
+
+int HashIndex::_recursive_remove(const vector<string> &path, bool top) {
   vector<string> subdirs;
+  dout(20) << __func__ << " path=" << path << dendl;
   int r = list_subdirs(path, &subdirs);
   if (r < 0)
     return r;
@@ -565,12 +670,15 @@ int HashIndex::recursive_remove(const vector<string> &path) {
        i != subdirs.end();
        ++i) {
     subdir.push_back(*i);
-    r = recursive_remove(subdir);
+    r = _recursive_remove(subdir, false);
     if (r < 0)
       return r;
     subdir.pop_back();
   }
-  return remove_path(path);
+  if (top)
+    return 0;
+  else
+    return remove_path(path);
 }
 
 int HashIndex::start_col_split(const vector<string> &path) {
@@ -634,7 +742,7 @@ bool HashIndex::must_merge(const subdir_info_s &info) {
 
 bool HashIndex::must_split(const subdir_info_s &info) {
   return (info.hash_level < (unsigned)MAX_HASH_LEVEL &&
-	  info.objs > ((unsigned)(abs(merge_threshold)) * 16 * split_multiplier));
+	  info.objs > ((unsigned)(abs(merge_threshold) * split_multiplier + settings.split_rand_factor) * 16));
 
 }
 
@@ -1003,7 +1111,7 @@ int HashIndex::list_by_hash_bitwise(
 	}
 	if (cmp_bitwise(j->second, end) >= 0) {
 	  if (next)
-	    *next = ghobject_t::get_max();
+	    *next = j->second;
 	  return 0;
 	}
 	if (!next || cmp_bitwise(j->second, *next) >= 0) {
@@ -1069,7 +1177,7 @@ int HashIndex::list_by_hash_nibblewise(
 	}
 	if (cmp_nibblewise(j->second, end) >= 0) {
 	  if (next)
-	    *next = ghobject_t::get_max();
+	    *next = j->second;
 	  return 0;
 	}
 	if (!next || cmp_nibblewise(j->second, *next) >= 0) {

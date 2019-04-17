@@ -21,6 +21,11 @@ import tempfile
 import unittest
 from ceph_disk import main
 
+try:
+    import builtins
+except:
+    import __builtin__ as builtins
+
 
 def fail_to_mount(dev, fstype, options):
     raise main.MountError(dev + " mount fail")
@@ -147,7 +152,7 @@ class TestCephDisk(object):
             main.PTYPE['plain']['osd']['ready']: 'plain',
             main.PTYPE['luks']['osd']['ready']: 'luks',
         }
-        for (ptype, type) in ptype2type.iteritems():
+        for (ptype, type) in ptype2type.items():
             for holders in ((), ("dm_0",), ("dm_0", "dm_1")):
                 dev = {
                     'dmcrypt': {
@@ -175,7 +180,7 @@ class TestCephDisk(object):
             main.PTYPE['plain']['journal']['ready']: 'plain',
             main.PTYPE['luks']['journal']['ready']: 'luks',
         }
-        for (ptype, type) in ptype2type.iteritems():
+        for (ptype, type) in ptype2type.items():
             for holders in ((), ("dm_0",)):
                 dev = {
                     'path': '/dev/Xda2',
@@ -314,7 +319,7 @@ class TestCephDisk(object):
             main.PTYPE['plain']['osd']['ready']: 'plain',
             main.PTYPE['luks']['osd']['ready']: 'LUKS',
         }
-        for (partition_type, type) in partition_type2type.iteritems():
+        for (partition_type, type) in partition_type2type.items():
             #
             # dmcrypt data partition with one holder
             #
@@ -682,7 +687,7 @@ class TestCephDiskDeactivateAndDestroy(unittest.TestCase):
     def setup_class(self):
         main.setup_logging(verbose=True, log_stdout=False)
 
-    @patch('__builtin__.open')
+    @patch('{0}.open'.format(builtins.__name__))
     def test_main_deactivate(self, mock_open):
         data = tempfile.mkdtemp()
         main.setup_statedir(data)
@@ -1286,6 +1291,35 @@ class TestCephDiskDeactivateAndDestroy(unittest.TestCase):
         ):
             self.assertRaises(Exception, main._deallocate_osd_id,
                               cluster, osd_id)
+
+    def test_main_fix(self):
+        args = main.parse_args(['fix', '--all', '--selinux', '--permissions'])
+        commands = []
+
+        def _command(x):
+            commands.append(" ".join(x))
+            return ("", "", None)
+
+        class Os(object):
+            F_OK = 0
+
+            @staticmethod
+            def access(x, y):
+                return True
+
+        with patch.multiple(
+            main,
+            command=_command,
+            command_init=lambda x: commands.append(x),
+            command_wait=lambda x: None,
+            os=Os,
+        ):
+            main.main_fix(args)
+            commands = " ".join(commands)
+            assert '/var/lib/ceph' in commands
+            assert 'restorecon' in commands
+            assert 'chown' in commands
+            assert 'find' in commands
 
 
 def raise_command_error(*args):

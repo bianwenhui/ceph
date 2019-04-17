@@ -259,8 +259,8 @@ public:
     utime_t last_scrub_stamp;
     scrub_stamp_info_t() : scrub_start_version(0), last_scrub_version(0) {}
     void reset() {
-      scrub_start_version = 0;
-      scrub_start_stamp = utime_t();
+      scrub_start_version = last_scrub_version = 0;
+      scrub_start_stamp = last_scrub_stamp = utime_t();
     }
   };
 
@@ -632,6 +632,10 @@ public:
   elist<CInode*>::item item_dirty_dirfrag_dirfragtree;
   elist<CInode*>::item item_scrub;
 
+  // also update RecoveryQueue::RecoveryQueue() if you change this
+  elist<CInode*>::item& item_recover_queue = item_dirty_dirfrag_dir;
+  elist<CInode*>::item& item_recover_queue_front = item_dirty_dirfrag_nest;
+
 public:
   int auth_pin_freeze_allowance;
 
@@ -739,9 +743,9 @@ public:
 
   // -- misc -- 
   bool is_projected_ancestor_of(CInode *other);
-  void make_path_string(std::string& s, bool force=false, CDentry *use_parent=NULL) const;
-  void make_path_string_projected(std::string& s) const;
-  void make_path(filepath& s) const;
+
+  void make_path_string(std::string& s, bool projected=false, const CDentry *use_parent=NULL) const;
+  void make_path(filepath& s, bool projected=false) const;
   void name_stray_dentry(std::string& dname);
   
   // -- dirtyness --
@@ -932,9 +936,9 @@ public:
   }
 
   client_t calc_ideal_loner();
-  client_t choose_ideal_loner();
-  bool try_set_loner();
   void set_loner_cap(client_t l);
+  bool choose_ideal_loner();
+  bool try_set_loner();
   bool try_drop_loner();
 
   // choose new lock state during recovery, based on issued caps

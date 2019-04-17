@@ -191,10 +191,9 @@ class RGWRemoteMetaLog : public RGWCoroutinesManager {
   RGWSyncBackoff backoff;
 
   RGWMetaSyncEnv sync_env;
-  rgw_meta_sync_status sync_status;
 
   void init_sync_env(RGWMetaSyncEnv *env);
-  int store_sync_info();
+  int store_sync_info(const rgw_meta_sync_info& sync_info);
 
   atomic_t going_down;
 
@@ -212,9 +211,9 @@ public:
   void finish();
 
   int read_log_info(rgw_mdlog_info *log_info);
-  int read_master_log_shards_info(string *master_period, map<int, RGWMetadataLogInfo> *shards_info);
+  int read_master_log_shards_info(const string& master_period, map<int, RGWMetadataLogInfo> *shards_info);
   int read_master_log_shards_next(const string& period, map<int, string> shard_markers, map<int, rgw_mdlog_shard_data> *result);
-  int read_sync_status();
+  int read_sync_status(rgw_meta_sync_status *sync_status);
   int init_sync_status();
   int run_sync();
 
@@ -223,7 +222,6 @@ public:
   RGWMetaSyncEnv& get_sync_env() {
     return sync_env;
   }
-  const rgw_meta_sync_status& get_sync_status() const { return sync_status; }
 };
 
 class RGWMetaSyncStatusManager {
@@ -257,18 +255,15 @@ public:
     : store(_store), master_log(store, async_rados, this),
       ts_to_shard_lock("ts_to_shard_lock") {}
   int init();
-  void finish();
 
-  const rgw_meta_sync_status& get_sync_status() const {
-    return master_log.get_sync_status();
+  int read_sync_status(rgw_meta_sync_status *sync_status) {
+    return master_log.read_sync_status(sync_status);
   }
-
-  int read_sync_status() { return master_log.read_sync_status(); }
   int init_sync_status() { return master_log.init_sync_status(); }
   int read_log_info(rgw_mdlog_info *log_info) {
     return master_log.read_log_info(log_info);
   }
-  int read_master_log_shards_info(string *master_period, map<int, RGWMetadataLogInfo> *shards_info) {
+  int read_master_log_shards_info(const string& master_period, map<int, RGWMetadataLogInfo> *shards_info) {
     return master_log.read_master_log_shards_info(master_period, shards_info);
   }
   int read_master_log_shards_next(const string& period, map<int, string> shard_markers, map<int, rgw_mdlog_shard_data> *result) {
@@ -294,9 +289,7 @@ class RGWSyncShardMarkerTrack {
   };
   typename std::map<T, marker_entry> pending;
 
-  T high_marker;
-  T last_stored_marker;
-  marker_entry high_entry;
+  map<T, marker_entry> finish_markers;
 
   int window_size;
   int updates_since_flush;
@@ -321,10 +314,7 @@ public:
   }
 
   void try_update_high_marker(const T& pos, int index_pos, const real_time& timestamp) {
-    if (!(pos <= high_marker)) {
-      high_marker = pos;
-      high_entry = marker_entry(index_pos, timestamp);
-    }
+    finish_markers[pos] = marker_entry(index_pos, timestamp);
   }
 
   RGWCoroutine *finish(const T& pos) {
@@ -345,10 +335,7 @@ public:
       return NULL;
     }
 
-    if (!(pos <= high_marker)) {
-      high_marker = pos;
-      high_entry = pos_iter->second;
-    }
+    finish_markers[pos] = pos_iter->second;
 
     pending.erase(pos);
 
@@ -363,13 +350,29 @@ public:
   }
 
   RGWCoroutine *flush() {
-    if (last_stored_marker == high_marker) {
+    if (finish_markers.empty()) {
       return NULL;
     }
 
+    typename std::map<T, marker_entry>::iterator i;
+
+    if (pending.empty()) {
+      i = finish_markers.end();
+    } else {
+      i = finish_markers.lower_bound(pending.begin()->first);
+    }
+    if (i == finish_markers.begin()) {
+      return NULL;
+    }
     updates_since_flush = 0;
-    last_stored_marker = high_marker;
-    return store_marker(high_marker, high_entry.pos, high_entry.timestamp);
+
+    auto last = i;
+    --i;
+    const T& high_marker = i->first;
+    marker_entry& high_entry = i->second;
+    RGWCoroutine *cr = store_marker(high_marker, high_entry.pos, high_entry.timestamp);
+    finish_markers.erase(finish_markers.begin(), last);
+    return cr;
   }
 
   /*
@@ -444,5 +447,13 @@ public:
   int operate();
 };
 
+// MetaLogTrimCR factory function
+RGWCoroutine* create_meta_log_trim_cr(RGWRados *store, RGWHTTPManager *http,
+                                      int num_shards, utime_t interval);
+
+// factory function for mdlog trim via radosgw-admin
+RGWCoroutine* create_admin_meta_log_trim_cr(RGWRados *store,
+                                            RGWHTTPManager *http,
+                                            int num_shards);
 
 #endif

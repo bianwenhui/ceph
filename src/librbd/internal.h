@@ -95,6 +95,8 @@ namespace librbd {
   int list(librados::IoCtx& io_ctx, std::vector<std::string>& names);
   int list_children(ImageCtx *ictx,
 		    std::set<std::pair<std::string, std::string> > & names);
+  int list_children_info(ImageCtx *ictx, librbd::parent_spec parent_spec,
+             std::map<std::pair<int64_t, std::string >, std::set<std::string> >& image_info);
   int create(librados::IoCtx& io_ctx, const char *imgname, uint64_t size,
 	     int *order);
   int create(librados::IoCtx& io_ctx, const char *imgname, uint64_t size,
@@ -110,7 +112,8 @@ namespace librbd {
                 uint8_t journal_splay_width,
                 const std::string &journal_pool,
                 const std::string &non_primary_global_image_id,
-                const std::string &primary_mirror_uuid);
+                const std::string &primary_mirror_uuid,
+                bool negotiate_features);
   int clone(IoCtx& p_ioctx, const char *p_name, const char *p_snap_name,
 	    IoCtx& c_ioctx, const char *c_name,
 	    uint64_t features, int *c_order,
@@ -133,9 +136,16 @@ namespace librbd {
   int get_flags(ImageCtx *ictx, uint64_t *flags);
   int set_image_notification(ImageCtx *ictx, int fd, int type);
   int is_exclusive_lock_owner(ImageCtx *ictx, bool *is_owner);
+  int lock_acquire(ImageCtx *ictx, rbd_lock_mode_t lock_mode);
+  int lock_release(ImageCtx *ictx);
+  int lock_get_owners(ImageCtx *ictx, rbd_lock_mode_t *lock_mode,
+                      std::list<std::string> *lock_owners);
+  int lock_break(ImageCtx *ictx, rbd_lock_mode_t lock_mode,
+                 const std::string &lock_owner);
 
-  int remove(librados::IoCtx& io_ctx, const char *imgname,
-	     ProgressContext& prog_ctx, bool force=false);
+  int remove(librados::IoCtx& io_ctx, const std::string &image_name,
+             const std::string &image_id, ProgressContext& prog_ctx,
+             bool force=false);
   int snap_list(ImageCtx *ictx, std::vector<snap_info_t>& snaps);
   int snap_exists(ImageCtx *ictx, const char *snap_name, bool *exists);
   int snap_is_protected(ImageCtx *ictx, const char *snap_name,
@@ -206,7 +216,7 @@ namespace librbd {
   int mirror_image_status_summary(IoCtx& io_ctx,
       std::map<mirror_image_status_state_t, int> *states);
 
-  int mirror_image_enable(ImageCtx *ictx);
+  int mirror_image_enable(ImageCtx *ictx, bool relax_same_pool_parent_check);
   int mirror_image_disable(ImageCtx *ictx, bool force);
   int mirror_image_promote(ImageCtx *ictx, bool force);
   int mirror_image_demote(ImageCtx *ictx);

@@ -9,7 +9,7 @@
 #include "ClientSnapRealm.h"
 #include "UserGroups.h"
 
-ostream& operator<<(ostream &out, Inode &in)
+ostream& operator<<(ostream &out, const Inode &in)
 {
   out << in.vino() << "("
       << "faked_ino=" << in.faked_ino
@@ -23,10 +23,11 @@ ostream& operator<<(ostream &out, Inode &in)
       << " caps=" << ccap_string(in.caps_issued());
   if (!in.caps.empty()) {
     out << "(";
-    for (map<mds_rank_t,Cap*>::iterator p = in.caps.begin(); p != in.caps.end(); ++p) {
-      if (p != in.caps.begin())
+    bool first = true;
+    for (const auto &pair : in.caps) {
+      if (!first)
         out << ',';
-      out << p->first << '=' << ccap_string(p->second->issued);
+      out << pair.first << '=' << ccap_string(pair.second->issued);
     }
     out << ")";
   }
@@ -147,7 +148,7 @@ bool Inode::is_any_caps()
   return !caps.empty() || snap_caps;
 }
 
-bool Inode::cap_is_valid(Cap* cap)
+bool Inode::cap_is_valid(Cap* cap) const
 {
   /*cout << "cap_gen     " << cap->session-> cap_gen << std::endl
     << "session gen " << cap->gen << std::endl
@@ -160,17 +161,23 @@ bool Inode::cap_is_valid(Cap* cap)
   return false;
 }
 
-int Inode::caps_issued(int *implemented)
+int Inode::caps_issued(int *implemented) const
 {
   int c = snap_caps;
   int i = 0;
-  for (map<mds_rank_t,Cap*>::iterator it = caps.begin();
+  for (map<mds_rank_t,Cap*>::const_iterator it = caps.begin();
        it != caps.end();
        ++it)
     if (cap_is_valid(it->second)) {
       c |= it->second->issued;
       i |= it->second->implemented;
     }
+  // exclude caps issued by non-auth MDS, but are been revoking by
+  // the auth MDS. The non-auth MDS should be revoking/exporting
+  // these caps, but the message is delayed.
+  if (auth_cap)
+    c &= ~auth_cap->implemented | auth_cap->issued;
+
   if (implemented)
     *implemented = i;
   return c;

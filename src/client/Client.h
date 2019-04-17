@@ -284,7 +284,6 @@ class Client : public Dispatcher, public md_config_obs_t {
   client_getgroups_callback_t getgroups_cb;
   client_umask_callback_t umask_cb;
   bool can_invalidate_dentries;
-  bool require_remount;
 
   Finisher async_ino_invalidator;
   Finisher async_dentry_invalidator;
@@ -345,6 +344,7 @@ protected:
   MetaSession *_open_mds_session(mds_rank_t mds);
   void _close_mds_session(MetaSession *s);
   void _closed_mds_session(MetaSession *s);
+  bool _any_stale_sessions() const;
   void _kick_stale_sessions();
   void handle_client_session(MClientSession *m);
   void send_reconnect(MetaSession *s);
@@ -439,7 +439,7 @@ protected:
 
   // Optional extra metadata about me to send to the MDS
   std::map<std::string, std::string> metadata;
-  void populate_metadata();
+  void populate_metadata(const std::string &mount_root);
 
 
   /* async block write barrier support */
@@ -563,10 +563,7 @@ protected:
 
   int authenticate();
 
-  void put_qtree(Inode *in);
-  void invalidate_quota_tree(Inode *in);
   Inode* get_quota_root(Inode *in);
-
   bool check_quota_condition(
       Inode *in,
       std::function<bool (const Inode &)> test);
@@ -668,7 +665,7 @@ protected:
   void _schedule_invalidate_callback(Inode *in, int64_t off, int64_t len);
   void _invalidate_inode_cache(Inode *in);
   void _invalidate_inode_cache(Inode *in, int64_t off, int64_t len);
-  void _async_invalidate(InodeRef& in, int64_t off, int64_t len);
+  void _async_invalidate(vinodeno_t ino, int64_t off, int64_t len);
   bool _release(Inode *in);
   
   /**
@@ -742,6 +739,8 @@ private:
   int _release_fh(Fh *fh);
   void _put_fh(Fh *fh);
 
+  int _do_remount(void);
+  friend class C_Client_Remount;
 
   struct C_Readahead : public Context {
     Client *client;
@@ -756,8 +755,8 @@ private:
 
   // internal interface
   //   call these with client_lock held!
-  int _do_lookup(Inode *dir, const string& name, InodeRef *target, int uid, int gid);
-  int _lookup(Inode *dir, const string& dname, InodeRef *target, int uid, int gid);
+  int _do_lookup(Inode *dir, const string& name, int mask, InodeRef *target, int uid, int gid);
+  int _lookup(Inode *dir, const string& dname, int mask, InodeRef *target, int uid, int gid);
 
   int _link(Inode *in, Inode *dir, const char *name, int uid=-1, int gid=-1, InodeRef *inp = 0);
   int _unlink(Inode *dir, const char *name, int uid=-1, int gid=-1);
@@ -780,6 +779,8 @@ private:
   int _do_setxattr(Inode *in, const char *name, const void *value, size_t len, int flags, int uid, int gid);
   int _setxattr(Inode *in, const char *name, const void *value, size_t len, int flags, int uid=-1, int gid=-1);
   int _setxattr(InodeRef &in, const char *name, const void *value, size_t len, int flags);
+  int _setxattr_check_data_pool(string& name, string& value, const OSDMap *osdmap);
+  void _setxattr_maybe_wait_for_osdmap(const char *name, const void *value, size_t len);
   int _removexattr(Inode *in, const char *nm, int uid=-1, int gid=-1);
   int _removexattr(InodeRef &in, const char *nm);
   int _open(Inode *in, int flags, mode_t mode, Fh **fhp, int uid, int gid);
@@ -845,8 +846,6 @@ private:
   int may_hardlink(Inode *in, int uid=-1, int gid=-1);
   int _getattr_for_perm(Inode *in, int uid, int gid);
   int _getgrouplist(gid_t **sgids, int uid, int gid);
-
-  int check_data_pool_exist(string name, string value, const OSDMap *osdmap);
 
   vinodeno_t _get_vino(Inode *in);
   inodeno_t _get_inodeno(Inode *in);
@@ -1016,7 +1015,7 @@ public:
   int fake_write_size(int fd, loff_t size);
   int ftruncate(int fd, loff_t size);
   int fsync(int fd, bool syncdataonly);
-  int fstat(int fd, struct stat *stbuf);
+  int fstat(int fd, struct stat *stbuf, int mask=CEPH_STAT_CAP_INODE_ALL);
   int fallocate(int fd, int mode, loff_t offset, loff_t length);
 
   // full path xattr ops
@@ -1064,11 +1063,6 @@ public:
   int get_caps_issued(int fd);
   int get_caps_issued(const char *path);
 
-  // low-level interface v2
-  inodeno_t ll_get_inodeno(Inode *in) {
-    Mutex::Locker lock(client_lock);
-    return _get_inodeno(in);
-  }
   snapid_t ll_get_snapid(Inode *in);
   vinodeno_t ll_get_vino(Inode *in) {
     Mutex::Locker lock(client_lock);

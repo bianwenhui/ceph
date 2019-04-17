@@ -361,12 +361,13 @@ TEST(LibCephFS, DirLs) {
 
   // test getdents
   struct dirent *getdents_entries;
-  getdents_entries = (struct dirent *)malloc(r * sizeof(*getdents_entries));
+  size_t getdents_entries_len = (r + 2) * sizeof(*getdents_entries);
+  getdents_entries = (struct dirent *)malloc(getdents_entries_len);
 
   int count = 0;
   std::vector<std::string> found;
   while (true) {
-    int len = ceph_getdents(cmount, ls_dir, (char *)getdents_entries, r * sizeof(*getdents_entries));
+    int len = ceph_getdents(cmount, ls_dir, (char *)getdents_entries, getdents_entries_len);
     if (len == 0)
       break;
     ASSERT_GT(len, 0);
@@ -1372,5 +1373,43 @@ TEST(LibCephFS, OpenNoClose) {
   ASSERT_LT(0, fd);
 
   // shutdown should force close opened file/dir
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, OperationsOnRoot)
+{
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char dirname[32];
+  sprintf(dirname, "/somedir%x", getpid());
+
+  ASSERT_EQ(ceph_mkdir(cmount, dirname, 0755), 0);
+
+  ASSERT_EQ(ceph_rmdir(cmount, "/"), -EBUSY);
+
+  ASSERT_EQ(ceph_link(cmount, "/", "/"), -EEXIST);
+  ASSERT_EQ(ceph_link(cmount, dirname, "/"), -EEXIST);
+  ASSERT_EQ(ceph_link(cmount, "nonExisitingDir", "/"), -ENOENT);
+
+  ASSERT_EQ(ceph_unlink(cmount, "/"), -EISDIR);
+
+  ASSERT_EQ(ceph_rename(cmount, "/", "/"), -EBUSY);
+  ASSERT_EQ(ceph_rename(cmount, dirname, "/"), -EBUSY);
+  ASSERT_EQ(ceph_rename(cmount, "nonExistingDir", "/"), -EBUSY);
+  ASSERT_EQ(ceph_rename(cmount, "/", dirname), -EBUSY);
+  ASSERT_EQ(ceph_rename(cmount, "/", "nonExistingDir"), -EBUSY);
+
+  ASSERT_EQ(ceph_mkdir(cmount, "/", 0777), -EEXIST);
+
+  ASSERT_EQ(ceph_mknod(cmount, "/", 0, 0), -EEXIST);
+
+  ASSERT_EQ(ceph_symlink(cmount, "/", "/"), -EEXIST);
+  ASSERT_EQ(ceph_symlink(cmount, dirname, "/"), -EEXIST);
+  ASSERT_EQ(ceph_symlink(cmount, "nonExistingDir", "/"), -EEXIST);
+
   ceph_shutdown(cmount);
 }

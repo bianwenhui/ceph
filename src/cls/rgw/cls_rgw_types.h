@@ -11,7 +11,9 @@
 
 #define CEPH_RGW_REMOVE 'r'
 #define CEPH_RGW_UPDATE 'u'
-#define CEPH_RGW_TAG_TIMEOUT 60*60*24
+#define CEPH_RGW_TAG_TIMEOUT 120
+#define CEPH_RGW_DIR_SUGGEST_LOG_OP  0x80
+#define CEPH_RGW_DIR_SUGGEST_OP_MASK 0x7f
 
 class JSONObj;
 
@@ -46,6 +48,13 @@ enum RGWCheckMTimeType {
   CLS_RGW_CHECK_TIME_MTIME_GT = 3,
   CLS_RGW_CHECK_TIME_MTIME_GE = 4,
 };
+
+#define ROUND_BLOCK_SIZE 4096
+
+static inline uint64_t cls_rgw_get_rounded_size(uint64_t size)
+{
+  return (size + ROUND_BLOCK_SIZE - 1) & ~(ROUND_BLOCK_SIZE - 1);
+}
 
 struct rgw_bucket_pending_info {
   RGWPendingState state;
@@ -86,12 +95,13 @@ struct rgw_bucket_dir_entry_meta {
   string owner_display_name;
   string content_type;
   uint64_t accounted_size;
+  string user_data;
 
   rgw_bucket_dir_entry_meta() :
   category(0), size(0), accounted_size(0) { }
 
   void encode(bufferlist &bl) const {
-    ENCODE_START(4, 3, bl);
+    ENCODE_START(5, 3, bl);
     ::encode(category, bl);
     ::encode(size, bl);
     ::encode(mtime, bl);
@@ -100,10 +110,11 @@ struct rgw_bucket_dir_entry_meta {
     ::encode(owner_display_name, bl);
     ::encode(content_type, bl);
     ::encode(accounted_size, bl);
+    ::encode(user_data, bl);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator &bl) {
-    DECODE_START_LEGACY_COMPAT_LEN(4, 3, 3, bl);
+    DECODE_START_LEGACY_COMPAT_LEN(5, 3, 3, bl);
     ::decode(category, bl);
     ::decode(size, bl);
     ::decode(mtime, bl);
@@ -116,6 +127,8 @@ struct rgw_bucket_dir_entry_meta {
       ::decode(accounted_size, bl);
     else
       accounted_size = size;
+    if (struct_v >= 5)
+      ::decode(user_data, bl);
     DECODE_FINISH(bl);
   }
   void dump(Formatter *f) const;
@@ -359,6 +372,8 @@ enum BIIndexType {
   OLHIdx        = 3,
 };
 
+struct rgw_bucket_category_stats;
+
 struct rgw_cls_bi_entry {
   BIIndexType type;
   string idx;
@@ -386,6 +401,8 @@ struct rgw_cls_bi_entry {
 
   void dump(Formatter *f) const;
   void decode_json(JSONObj *obj, cls_rgw_obj_key *effective_key = NULL);
+
+  bool get_info(cls_rgw_obj_key *key, uint8_t *category, rgw_bucket_category_stats *accounted_stats);
 };
 WRITE_CLASS_ENCODER(rgw_cls_bi_entry)
 
@@ -883,6 +900,10 @@ struct cls_rgw_obj_chain {
   }
   static void generate_test_instances(list<cls_rgw_obj_chain*>& ls) {
     ls.push_back(new cls_rgw_obj_chain);
+  }
+
+  bool empty() {
+    return objs.empty();
   }
 };
 WRITE_CLASS_ENCODER(cls_rgw_obj_chain)

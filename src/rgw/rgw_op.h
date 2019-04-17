@@ -18,6 +18,8 @@
 #include <set>
 #include <map>
 
+#include <boost/optional.hpp>
+
 #include "common/armor.h"
 #include "common/mime.h"
 #include "common/utf8.h"
@@ -32,6 +34,8 @@
 #include "rgw_acl.h"
 #include "rgw_cors.h"
 #include "rgw_quota.h"
+#include "cls/lock/cls_lock_client.h"
+#include "cls/rgw/cls_rgw_client.h"
 
 #include "include/assert.h"
 
@@ -57,6 +61,7 @@ protected:
   int do_aws4_auth_completion();
 
   virtual int init_quota();
+
 public:
 RGWOp() : s(nullptr), dialect_handler(nullptr), store(nullptr),
     cors_exist(false), op_ret(0) {}
@@ -424,6 +429,7 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "get_bucket_location"; }
+  virtual RGWOpType get_type() { return RGW_OP_GET_BUCKET_LOCATION; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
@@ -447,6 +453,7 @@ public:
 class RGWSetBucketVersioning : public RGWOp {
 protected:
   bool enable_versioning;
+  bufferlist in_data;
 public:
   RGWSetBucketVersioning() : enable_versioning(false) {}
 
@@ -535,7 +542,7 @@ protected:
   obj_version ep_objv;
   bool has_cors;
   RGWCORSConfiguration cors_config;
-  string swift_ver_location;
+  boost::optional<std::string> swift_ver_location;
   map<string, buffer::list> attrs;
   set<string> rmattr_names;
 
@@ -647,6 +654,15 @@ protected:
   const char *supplied_etag;
   const char *if_match;
   const char *if_nomatch;
+  const char *copy_source;
+  const char *copy_source_range;
+  RGWBucketInfo copy_source_bucket_info;
+  string copy_source_tenant_name;
+  string copy_source_bucket_name;
+  string copy_source_object_name;
+  string copy_source_version_id;
+  off_t copy_source_range_fst;
+  off_t copy_source_range_lst;
   string etag;
   bool chunked_upload;
   RGWAccessControlPolicy policy;
@@ -656,8 +672,10 @@ protected:
   ceph::real_time mtime;
   uint64_t olh_epoch;
   string version_id;
+  bufferlist bl_aux;
+  string user_data;
 
-  ceph::real_time delete_at;
+  boost::optional<ceph::real_time> delete_at;
 
 public:
   RGWPutObj() : ofs(0),
@@ -665,6 +683,10 @@ public:
                 supplied_etag(NULL),
                 if_match(NULL),
                 if_nomatch(NULL),
+                copy_source(NULL),
+                copy_source_range(NULL),
+                copy_source_range_fst(0),
+                copy_source_range_lst(0),
                 chunked_upload(0),
                 dlo_manifest(NULL),
                 slo_info(NULL),
@@ -689,6 +711,9 @@ public:
   int verify_permission();
   void pre_exec();
   void execute();
+
+  int get_data_cb(bufferlist& bl, off_t bl_ofs, off_t bl_len);
+  int get_data(const off_t fst, const off_t lst, bufferlist& bl);
 
   virtual int get_params() = 0;
   virtual int get_data(bufferlist& bl) = 0;
@@ -715,7 +740,7 @@ protected:
   string content_type;
   RGWAccessControlPolicy policy;
   map<string, bufferlist> attrs;
-  ceph::real_time delete_at;
+  boost::optional<ceph::real_time> delete_at;
 
 public:
   RGWPostObj() : min_len(0), max_len(LLONG_MAX), len(0), ofs(0),
@@ -781,7 +806,7 @@ protected:
   RGWAccessControlPolicy policy;
   RGWCORSConfiguration cors_config;
   string placement_rule;
-  string swift_ver_location;
+  boost::optional<std::string> swift_ver_location;
 
 public:
   RGWPutMetadataBucket()
@@ -812,7 +837,7 @@ class RGWPutMetadataObject : public RGWOp {
 protected:
   RGWAccessControlPolicy policy;
   string placement_rule;
-  ceph::real_time delete_at;
+  boost::optional<ceph::real_time> delete_at;
   const char *dlo_manifest;
 
 public:
@@ -902,7 +927,7 @@ protected:
   string version_id;
   uint64_t olh_epoch;
 
-  ceph::real_time delete_at;
+  boost::optional<ceph::real_time> delete_at;
   bool copy_if_newer;
 
   int init_common();
@@ -1012,6 +1037,7 @@ public:
 class RGWPutCORS : public RGWOp {
 protected:
   bufferlist cors_bl;
+  bufferlist in_data;
 
 public:
   RGWPutCORS() {}
@@ -1127,6 +1153,27 @@ protected:
   char *data;
   int len;
 
+  struct MPSerializer {
+    librados::IoCtx ioctx;
+    rados::cls::lock::Lock lock;
+    librados::ObjectWriteOperation op;
+    std::string oid;
+    bool locked;
+
+    MPSerializer() : lock("RGWCompleteMultipart"), locked(false)
+      {}
+
+    int try_lock(const std::string& oid, utime_t dur);
+
+    int unlock() {
+      return lock.unlock(&ioctx, oid);
+    }
+
+    void clear_locked() {
+      locked = false;
+    }
+  } serializer;
+
 public:
   RGWCompleteMultipart() {
     data = NULL;
@@ -1139,6 +1186,7 @@ public:
   int verify_permission();
   void pre_exec();
   void execute();
+  void complete();
 
   virtual int get_params() = 0;
   virtual void send_response() = 0;
@@ -1299,6 +1347,58 @@ public:
 };
 
 
+class RGWGetCrossDomainPolicy : public RGWOp {
+public:
+  RGWGetCrossDomainPolicy() = default;
+  ~RGWGetCrossDomainPolicy() = default;
+
+  int verify_permission() override {
+    return 0;
+  }
+
+  void execute() override {
+    op_ret = 0;
+  }
+
+  const string name() override {
+    return "get_crossdomain_policy";
+  }
+
+  RGWOpType get_type() override {
+    return RGW_OP_GET_CROSS_DOMAIN_POLICY;
+  }
+
+  uint32_t op_mask() override {
+    return RGW_OP_TYPE_READ;
+  }
+};
+
+
+class RGWGetHealthCheck : public RGWOp {
+public:
+  RGWGetHealthCheck() = default;
+  ~RGWGetHealthCheck() = default;
+
+  int verify_permission() override {
+    return 0;
+  }
+
+  void execute() override;
+
+  const string name() override {
+    return "get_health_check";
+  }
+
+  RGWOpType get_type() override {
+    return RGW_OP_GET_HEALTH_CHECK;
+  }
+
+  uint32_t op_mask() override {
+    return RGW_OP_TYPE_READ;
+  }
+};
+
+
 class RGWDeleteMultiObj : public RGWOp {
 protected:
   int max_to_delete;
@@ -1329,6 +1429,17 @@ public:
   virtual const string name() { return "multi_object_delete"; }
   virtual RGWOpType get_type() { return RGW_OP_DELETE_MULTI_OBJ; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_DELETE; }
+};
+
+class RGWInfo: public RGWOp {
+public:
+  RGWInfo() = default;
+  ~RGWInfo() = default;
+
+  int verify_permission() override { return 0; }
+  const string name() override { return "get info"; }
+  RGWOpType get_type() override { return RGW_OP_GET_INFO; }
+  uint32_t op_mask() override { return RGW_OP_TYPE_READ; }
 };
 
 class RGWHandler {
@@ -1469,15 +1580,15 @@ static inline void rgw_get_request_metadata(CephContext *cct,
   }
 } /* rgw_get_request_metadata */
 
-static inline void encode_delete_at_attr(ceph::real_time delete_at,
+static inline void encode_delete_at_attr(boost::optional<ceph::real_time> delete_at,
 					map<string, bufferlist>& attrs)
 {
-  if (real_clock::is_zero(delete_at)) {
+  if (delete_at == boost::none) {
     return;
-  }
+  } 
 
   bufferlist delatbl;
-  ::encode(delete_at, delatbl);
+  ::encode(*delete_at, delatbl);
   attrs[RGW_ATTR_DELETE_AT] = delatbl;
 } /* encode_delete_at_attr */
 
@@ -1508,5 +1619,56 @@ static inline void complete_etag(MD5& hash, string *etag)
 
   *etag = etag_buf_str;
 } /* complete_etag */
+
+class RGWSetAttrs : public RGWOp {
+protected:
+  map<string, buffer::list> attrs;
+
+public:
+  RGWSetAttrs() {}
+  virtual ~RGWSetAttrs() {}
+
+  void emplace_attr(std::string&& key, buffer::list&& bl) {
+    attrs.emplace(std::move(key), std::move(bl));
+  }
+
+  int verify_permission();
+  void pre_exec();
+  void execute();
+
+  virtual int get_params() = 0;
+  virtual void send_response() = 0;
+  virtual const string name() { return "set_attrs"; }
+  virtual RGWOpType get_type() { return RGW_OP_SET_ATTRS; }
+  virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
+};
+
+class RGWGetObjLayout : public RGWOp {
+protected:
+  RGWRados::Object *target{nullptr};
+  RGWObjManifest *manifest{nullptr};
+  rgw_obj head_obj;
+
+public:
+  RGWGetObjLayout() {
+    delete target;
+  }
+
+  int check_caps(RGWUserCaps& caps) {
+    return caps.check_cap("admin", RGW_CAP_READ);
+  }
+  int verify_permission() {
+    return check_caps(s->user->caps);
+  }
+  void pre_exec();
+  void execute();
+
+  virtual void send_response() = 0;
+  virtual const string name() { return "get_obj_layout"; }
+  virtual RGWOpType get_type() { return RGW_OP_GET_OBJ_LAYOUT; }
+  virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
+};
+
+
 
 #endif /* CEPH_RGW_OP_H */

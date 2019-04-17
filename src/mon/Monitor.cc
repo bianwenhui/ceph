@@ -142,6 +142,12 @@ long parse_pos_long(const char *s, ostream *pss)
   return r;
 }
 
+void C_MonContext::finish(int r) {
+  if (mon->is_shutdown())
+    return;
+  FunctionContext::finish(r);
+}
+
 Monitor::Monitor(CephContext* cct_, string nm, MonitorDBStore *s,
 		 Messenger *m, MonMap *map) :
   Dispatcher(cct_),
@@ -190,12 +196,8 @@ Monitor::Monitor(CephContext* cct_, string nm, MonitorDBStore *s,
   timecheck_rounds_since_clean(0),
   timecheck_event(NULL),
 
-  probe_timeout_event(NULL),
-
   paxos_service(PAXOS_NUM),
   admin_hook(NULL),
-  health_tick_event(NULL),
-  health_interval_event(NULL),
   routed_request_tid(0),
   op_tracker(cct, true, 1)
 {
@@ -1232,7 +1234,9 @@ void Monitor::sync_reset_timeout()
   dout(10) << __func__ << dendl;
   if (sync_timeout_event)
     timer.cancel_event(sync_timeout_event);
-  sync_timeout_event = new C_SyncTimeout(this);
+  sync_timeout_event = new C_MonContext(this, [this](int) {
+      sync_timeout();
+    });
   timer.add_event_after(g_conf->mon_sync_timeout, sync_timeout_event);
 }
 
@@ -1570,7 +1574,9 @@ void Monitor::cancel_probe_timeout()
 void Monitor::reset_probe_timeout()
 {
   cancel_probe_timeout();
-  probe_timeout_event = new C_ProbeTimeout(this);
+  probe_timeout_event = new C_MonContext(this, [this](int r) {
+      probe_timeout(r);
+    });
   double t = g_conf->mon_probe_timeout;
   timer.add_event_after(t, probe_timeout_event);
   dout(10) << "reset_probe_timeout " << probe_timeout_event << " after " << t << " seconds" << dendl;
@@ -1916,7 +1922,10 @@ void Monitor::win_election(epoch_t epoch, set<int>& active, uint64_t features,
     do_health_to_clog_interval();
     scrub_event_start();
   }
-  collect_sys_info(&metadata[rank], g_ceph_context);
+
+  Metadata my_meta;
+  collect_sys_info(&my_meta, g_ceph_context);
+  update_mon_metadata(rank, std::move(my_meta));
 }
 
 void Monitor::lose_election(epoch_t epoch, set<int> &q, int l, uint64_t features) 
@@ -2157,8 +2166,12 @@ void Monitor::health_tick_start()
   dout(15) << __func__ << dendl;
 
   health_tick_stop();
-  health_tick_event = new C_HealthToClogTick(this);
-
+  health_tick_event = new C_MonContext(this, [this](int r) {
+      if (r < 0)
+        return;
+      do_health_to_clog();
+      health_tick_start();
+    });
   timer.add_event_after(cct->_conf->mon_health_to_clog_tick_interval,
                         health_tick_event);
 }
@@ -2202,7 +2215,11 @@ void Monitor::health_interval_start()
 
   health_interval_stop();
   utime_t next = health_interval_calc_next_update();
-  health_interval_event = new C_HealthToClogInterval(this);
+  health_interval_event = new C_MonContext(this, [this](int r) {
+      if (r < 0)
+        return;
+      do_health_to_clog_interval();
+    });
   timer.add_event_at(next, health_interval_event);
 }
 
@@ -2475,7 +2492,7 @@ void Monitor::get_cluster_status(stringstream &ss, Formatter *f)
     ss << "     monmap " << *monmap << "\n";
     ss << "            election epoch " << get_epoch()
        << ", quorum " << get_quorum() << " " << get_quorum_names() << "\n";
-    if (mdsmon()->fsmap.any_filesystems()) {
+    if (mdsmon()->fsmap.filesystem_count() > 0) {
       ss << "      fsmap " << mdsmon()->fsmap << "\n";
     }
 
@@ -2634,7 +2651,19 @@ void Monitor::handle_command(MonOpRequestRef op)
     return;
   }
 
-  cmd_getval(g_ceph_context, cmdmap, "prefix", prefix);
+  // check return value. If no prefix parameter provided,
+  // return value will be false, then return error info.
+  if(!cmd_getval(g_ceph_context, cmdmap, "prefix", prefix)) {
+    reply_command(op, -EINVAL, "command prefix not found", 0);
+    return;
+  }
+
+  // check prefix is empty
+  if (prefix.empty()) {
+    reply_command(op, -EINVAL, "command prefix must not be empty", 0);
+    return;
+  }
+
   if (prefix == "get_command_descriptions") {
     bufferlist rdata;
     Formatter *f = Formatter::create("json");
@@ -2655,6 +2684,15 @@ void Monitor::handle_command(MonOpRequestRef op)
   boost::scoped_ptr<Formatter> f(Formatter::create(format));
 
   get_str_vec(prefix, fullcmd);
+
+  // make sure fullcmd is not empty.
+  // invalid prefix will cause empty vector fullcmd.
+  // such as, prefix=";,,;"
+  if (fullcmd.empty()) {
+    reply_command(op, -EINVAL, "command requires a prefix to be valid", 0);
+    return;
+  }
+
   module = fullcmd[0];
 
   // validate command is in leader map
@@ -3897,7 +3935,9 @@ void Monitor::timecheck_reset_event()
            << " rounds_since_clean " << timecheck_rounds_since_clean
            << dendl;
 
-  timecheck_event = new C_TimeCheck(this);
+  timecheck_event = new C_MonContext(this, [this](int) {
+      timecheck_start_round();
+    });
   timer.add_event_after(delay, timecheck_event);
 }
 
@@ -4268,7 +4308,7 @@ void Monitor::handle_subscribe(MonOpRequestRef op)
 	pgmon()->check_sub(s->sub_map["osd_pg_creates"]);
       }
     } else if (p->first == "monmap") {
-      check_sub(s->sub_map["monmap"]);
+      monmon()->check_sub(s->sub_map[p->first]);
     } else if (logmon()->sub_name_to_id(p->first) >= 0) {
       logmon()->check_sub(s->sub_map[p->first]);
     }
@@ -4357,32 +4397,6 @@ bool Monitor::ms_handle_reset(Connection *con)
   return true;
 }
 
-void Monitor::check_subs()
-{
-  string type = "monmap";
-  if (session_map.subs.count(type) == 0)
-    return;
-  xlist<Subscription*>::iterator p = session_map.subs[type]->begin();
-  while (!p.end()) {
-    Subscription *sub = *p;
-    ++p;
-    check_sub(sub);
-  }
-}
-
-void Monitor::check_sub(Subscription *sub)
-{
-  dout(10) << "check_sub monmap next " << sub->next << " have " << monmap->get_epoch() << dendl;
-  if (sub->next <= monmap->get_epoch()) {
-    send_latest_monmap(sub->session->con.get());
-    if (sub->onetime)
-      session_map.remove_sub(sub);
-    else
-      sub->next = monmap->get_epoch() + 1;
-  }
-}
-
-
 // -----
 
 void Monitor::send_latest_monmap(Connection *con)
@@ -4404,13 +4418,13 @@ void Monitor::handle_mon_metadata(MonOpRequestRef op)
   MMonMetadata *m = static_cast<MMonMetadata*>(op->get_req());
   if (is_leader()) {
     dout(10) << __func__ << dendl;
-    update_mon_metadata(m->get_source().num(), m->data);
+    update_mon_metadata(m->get_source().num(), std::move(m->data));
   }
 }
 
-void Monitor::update_mon_metadata(int from, const Metadata& m)
+void Monitor::update_mon_metadata(int from, Metadata&& m)
 {
-  metadata[from] = m;
+  pending_metadata.insert(make_pair(from, std::move(m)));
 
   bufferlist bl;
   int err = store->get(MONITOR_STORE_PREFIX, "last_metadata", bl);
@@ -4418,12 +4432,12 @@ void Monitor::update_mon_metadata(int from, const Metadata& m)
   if (!err) {
     bufferlist::iterator iter = bl.begin();
     ::decode(last_metadata, iter);
-    metadata.insert(last_metadata.begin(), last_metadata.end());
+    pending_metadata.insert(last_metadata.begin(), last_metadata.end());
   }
 
   MonitorDBStore::TransactionRef t = paxos->get_pending_transaction();
   bl.clear();
-  ::encode(metadata, bl);
+  ::encode(pending_metadata, bl);
   t->put(MONITOR_STORE_PREFIX, "last_metadata", bl);
   paxos->trigger_propose();
 }
@@ -4743,7 +4757,9 @@ void Monitor::scrub_event_start()
     return;
   }
 
-  scrub_event = new C_Scrub(this);
+  scrub_event = new C_MonContext(this, [this](int) {
+      scrub_start();
+    });
   timer.add_event_after(cct->_conf->mon_scrub_interval, scrub_event);
 }
 
@@ -4768,25 +4784,19 @@ void Monitor::scrub_reset_timeout()
 {
   dout(15) << __func__ << " reset timeout event" << dendl;
   scrub_cancel_timeout();
-  scrub_timeout_event = new C_ScrubTimeout(this);
+
+  scrub_timeout_event = new C_MonContext(this, [this](int) {
+      scrub_timeout();
+    });
   timer.add_event_after(g_conf->mon_scrub_timeout, scrub_timeout_event);
 }
 
 /************ TICK ***************/
-
-class C_Mon_Tick : public Context {
-  Monitor *mon;
-public:
-  explicit C_Mon_Tick(Monitor *m) : mon(m) {}
-  void finish(int r) {
-    mon->tick();
-  }
-};
-
 void Monitor::new_tick()
 {
-  C_Mon_Tick *ctx = new C_Mon_Tick(this);
-  timer.add_event_after(g_conf->mon_tick_interval, ctx);
+  timer.add_event_after(g_conf->mon_tick_interval, new C_MonContext(this, [this](int) {
+	tick();
+      }));
 }
 
 void Monitor::tick()
@@ -5105,8 +5115,10 @@ bool Monitor::ms_get_authorizer(int service_id, AuthAuthorizer **authorizer, boo
 }
 
 bool Monitor::ms_verify_authorizer(Connection *con, int peer_type,
-				   int protocol, bufferlist& authorizer_data, bufferlist& authorizer_reply,
-				   bool& isvalid, CryptoKey& session_key)
+				   int protocol, bufferlist& authorizer_data,
+				   bufferlist& authorizer_reply,
+				   bool& isvalid, CryptoKey& session_key,
+				   std::unique_ptr<AuthAuthorizerChallenge> *challenge)
 {
   dout(10) << "ms_verify_authorizer " << con->get_peer_addr()
 	   << " " << ceph_entity_type_name(peer_type)
@@ -5125,7 +5137,7 @@ bool Monitor::ms_verify_authorizer(Connection *con, int peer_type,
       
       if (authorizer_data.length()) {
 	bool ret = cephx_verify_authorizer(g_ceph_context, &keyring, iter,
-					  auth_ticket_info, authorizer_reply);
+					   auth_ticket_info, challenge, authorizer_reply);
 	if (ret) {
 	  session_key = auth_ticket_info.session_key;
 	  isvalid = true;

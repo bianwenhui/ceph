@@ -25,9 +25,10 @@ class RGWMongoose : public RGWStreamIO
   bool has_content_length;
   bool explicit_keepalive;
   bool explicit_conn_close;
+  bool got_eof_on_read;
 
 public:
-  void init_env(CephContext *cct);
+  int init_env(CephContext *cct) override;
 
   int write_data(const char *buf, int len);
   int read_data(char *buf, int len);
@@ -38,7 +39,7 @@ public:
   int complete_request();
   int send_content_length(uint64_t len);
 
-  RGWMongoose(mg_connection *_conn, int _port);
+  RGWMongoose(mg_connection *_conn);
   void flush();
 };
 

@@ -280,8 +280,9 @@ public:
   void on_global_recover(
     const hobject_t &oid,
     const object_stat_sum_t &stat_diff);
-  void failed_push(pg_shard_t from, const hobject_t &soid);
+  void failed_push(const list<pg_shard_t> &from, const hobject_t &soid) override;
   void cancel_pull(const hobject_t &soid);
+  void backfill_add_missing(const hobject_t &oid, eversion_t v) override;
 
   template <typename T>
   class BlessedGenContext : public GenContext<T> {
@@ -398,6 +399,22 @@ public:
     append_log(logv, trim_to, trim_rollback_to, t, transaction_applied);
   }
 
+  struct C_OSD_OnApplied : Context {
+    ReplicatedPGRef pg;
+    epoch_t epoch;
+    eversion_t v;
+    C_OSD_OnApplied(
+      ReplicatedPGRef pg,
+      epoch_t epoch,
+      eversion_t v)
+      : pg(pg), epoch(epoch), v(v) {}
+    void finish(int) override {
+      pg->lock();
+      if (!pg->pg_has_reset_since(epoch))
+	pg->op_applied(v);
+      pg->unlock();
+    }
+  };
   void op_applied(
     const eversion_t &applied_version);
 
@@ -878,7 +895,7 @@ protected:
     OpContext *ctx,
     ObjectContextRef obc,
     ceph_tid_t rep_tid);
-  RepGather *new_repop(
+  boost::intrusive_ptr<RepGather> new_repop(
     ObcLockManager &&manager,
     boost::optional<std::function<void(void)> > &&on_complete);
   void remove_repop(RepGather *repop);
@@ -1177,6 +1194,7 @@ protected:
     BLOCKED_PROMOTE,
     HANDLED_PROXY,
     HANDLED_REDIRECT,
+    REPLIED_WITH_EAGAIN,
   };
   cache_result_t maybe_handle_cache_detail(OpRequestRef op,
 					   bool write_ordered,
@@ -1384,8 +1402,8 @@ protected:
                                       PGBackend::PGTransaction *t);
   void finish_copyfrom(OpContext *ctx);
   void finish_promote(int r, CopyResults *results, ObjectContextRef obc);
-  void cancel_copy(CopyOpRef cop, bool requeue);
-  void cancel_copy_ops(bool requeue);
+  void cancel_copy(CopyOpRef cop, bool requeue, vector<ceph_tid_t> *tids);
+  void cancel_copy_ops(bool requeue, vector<ceph_tid_t> *tids);
 
   friend struct C_Copyfrom;
 
@@ -1399,8 +1417,8 @@ protected:
     boost::optional<std::function<void()>> &&on_flush);
   void finish_flush(hobject_t oid, ceph_tid_t tid, int r);
   int try_flush_mark_clean(FlushOpRef fop);
-  void cancel_flush(FlushOpRef fop, bool requeue);
-  void cancel_flush_ops(bool requeue);
+  void cancel_flush(FlushOpRef fop, bool requeue, vector<ceph_tid_t> *tids);
+  void cancel_flush_ops(bool requeue, vector<ceph_tid_t> *tids);
 
   /// @return false if clone is has been evicted
   bool is_present_clone(hobject_t coid);
@@ -1430,14 +1448,14 @@ protected:
 
   map<hobject_t, list<OpRequestRef>, hobject_t::BitwiseComparator> in_progress_proxy_ops;
   void kick_proxy_ops_blocked(hobject_t& soid);
-  void cancel_proxy_ops(bool requeue);
+  void cancel_proxy_ops(bool requeue, vector<ceph_tid_t> *tids);
 
   // -- proxyread --
   map<ceph_tid_t, ProxyReadOpRef> proxyread_ops;
 
   void do_proxy_read(OpRequestRef op);
   void finish_proxy_read(hobject_t oid, ceph_tid_t tid, int r);
-  void cancel_proxy_read(ProxyReadOpRef prdop);
+  void cancel_proxy_read(ProxyReadOpRef prdop, vector<ceph_tid_t> *tids);
 
   friend struct C_ProxyRead;
 
@@ -1446,7 +1464,7 @@ protected:
 
   void do_proxy_write(OpRequestRef op, const hobject_t& missing_oid);
   void finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r);
-  void cancel_proxy_write(ProxyWriteOpRef pwop);
+  void cancel_proxy_write(ProxyWriteOpRef pwop, vector<ceph_tid_t> *tids);
 
   friend struct C_ProxyWrite_Apply;
   friend struct C_ProxyWrite_Commit;
@@ -1477,7 +1495,7 @@ public:
     ThreadPool::TPHandle &handle);
   void do_backfill(OpRequestRef op);
 
-  OpContextUPtr trim_object(const hobject_t &coid);
+  int trim_object(const hobject_t &coid, OpContextUPtr* ctxp);
   void snap_trimmer(epoch_t e);
   int do_osd_ops(OpContext *ctx, vector<OSDOp>& ops);
 
@@ -1539,12 +1557,20 @@ public:
   }
 private:
   struct NotTrimming;
+  struct WaitReservation;
   struct SnapTrim : boost::statechart::event< SnapTrim > {
     SnapTrim() : boost::statechart::event < SnapTrim >() {}
   };
   struct Reset : boost::statechart::event< Reset > {
     Reset() : boost::statechart::event< Reset >() {}
   };
+  struct SnapTrimReserved : boost::statechart::event< SnapTrimReserved > {
+    SnapTrimReserved() : boost::statechart::event< SnapTrimReserved >() {}
+  };
+  struct SnapTrimTimerReady : boost::statechart::event< SnapTrimTimerReady > {
+    SnapTrimTimerReady() : boost::statechart::event< SnapTrimTimerReady >() {}
+  };
+
   struct SnapTrimmer : public boost::statechart::state_machine< SnapTrimmer, NotTrimming > {
     ReplicatedPG *pg;
     set<hobject_t, hobject_t::BitwiseComparator> in_flight;
@@ -1557,18 +1583,136 @@ private:
   } snap_trimmer_machine;
 
   /* SnapTrimmerStates */
-  struct TrimmingObjects : boost::statechart::state< TrimmingObjects, SnapTrimmer >, NamedState {
+  struct Trimming : boost::statechart::state< Trimming,
+					      SnapTrimmer,
+					      WaitReservation >,
+			   NamedState {
+    typedef boost::mpl::list <
+      boost::statechart::custom_reaction< SnapTrim >,
+      boost::statechart::transition< Reset, NotTrimming >
+      > reactions;
+    explicit Trimming(my_context ctx);
+    void exit();
+    boost::statechart::result react(const SnapTrim&) { return discard_event(); }
+  };
+
+  struct TrimmingObjects : boost::statechart::state<TrimmingObjects, Trimming>, NamedState {
     typedef boost::mpl::list <
       boost::statechart::custom_reaction< SnapTrim >,
       boost::statechart::transition< Reset, NotTrimming >
       > reactions;
     hobject_t pos;
     explicit TrimmingObjects(my_context ctx);
-    void exit();
+    void exit() { context< SnapTrimmer >().log_exit(state_name, enter_time); }
     boost::statechart::result react(const SnapTrim&);
   };
 
-  struct WaitingOnReplicas : boost::statechart::state< WaitingOnReplicas, SnapTrimmer >, NamedState {
+  struct WaitReservation : boost::statechart::state< WaitReservation, Trimming >, NamedState {
+    /* WaitReservation is a sub-state of trimming simply so that exiting Trimming
+     * always cancels the reservation */
+    typedef boost::mpl::list <
+      boost::statechart::custom_reaction< SnapTrimReserved >
+      > reactions;
+    struct ReservationCB : public Context {
+      ReplicatedPGRef pg;
+      bool canceled;
+      ReservationCB(ReplicatedPG *pg) : pg(pg), canceled(false) {}
+      void finish(int) override {
+        pg->lock();
+        if (!canceled)
+          pg->snap_trimmer_machine.process_event(SnapTrimReserved());
+        pg->unlock();
+      }
+      void cancel() {
+        assert(pg->is_locked());
+        assert(!canceled);
+        canceled = true;
+      }
+    };
+    ReservationCB *pending = nullptr;
+
+    explicit WaitReservation(my_context ctx)
+      : my_base(ctx),
+        NamedState(context< SnapTrimmer >().pg->cct, "Trimming/WaitReservation") {
+      context< SnapTrimmer >().log_enter(state_name);
+      auto *pg = context< SnapTrimmer >().pg;
+      pending = new ReservationCB(pg);
+      pg->osd->snap_reserver.request_reservation(pg->get_pgid(), pending, 0);
+      pg->state_set(PG_STATE_SNAPTRIM_WAIT);
+      pg->publish_stats_to_osd();
+    }
+    boost::statechart::result react(const SnapTrimReserved&);
+    void exit() {
+      context< SnapTrimmer >().log_exit(state_name, enter_time);
+      if (pending)
+        pending->cancel();
+      pending = nullptr;
+      auto *pg = context< SnapTrimmer >().pg;
+      pg->state_clear(PG_STATE_SNAPTRIM_WAIT);
+      pg->publish_stats_to_osd();
+    }
+    boost::statechart::result react(const SnapTrim&) {
+      return discard_event();
+    }
+  };
+
+  struct WaitTrimTimer : boost::statechart::state< WaitTrimTimer, Trimming >, NamedState {
+    typedef boost::mpl::list <
+      boost::statechart::custom_reaction< SnapTrimTimerReady >
+      > reactions;
+    Context *wakeup = nullptr;
+    bool slept = false;
+    explicit WaitTrimTimer(my_context ctx)
+      : my_base(ctx),
+	NamedState(context< SnapTrimmer >().pg->cct, "Trimming/WaitTrimTimer") {
+      context< SnapTrimmer >().log_enter(state_name);
+      struct OnTimer : Context {
+	ReplicatedPGRef pg;
+	epoch_t epoch;
+	OnTimer(ReplicatedPGRef pg, epoch_t epoch) : pg(pg), epoch(epoch) {}
+	void finish(int) override {
+	  pg->lock();
+	  if (!pg->pg_has_reset_since(epoch))
+	    pg->snap_trimmer_machine.process_event(SnapTrimTimerReady());
+	  pg->unlock();
+	}
+      };
+      auto *pg = context< SnapTrimmer >().pg;
+      if (pg->cct->_conf->osd_snap_trim_sleep > 0) {
+	wakeup = new OnTimer{pg, pg->get_osdmap()->get_epoch()};
+	Mutex::Locker l(pg->osd->snap_sleep_lock);
+	pg->osd->snap_sleep_timer.add_event_after(
+	  pg->cct->_conf->osd_snap_trim_sleep, wakeup);
+	slept = true;
+      } else {
+	post_event(SnapTrimTimerReady());
+      }
+    }
+    void exit() {
+      context< SnapTrimmer >().log_exit(state_name, enter_time);
+      auto *pg = context< SnapTrimmer >().pg;
+      if (wakeup) {
+	Mutex::Locker l(pg->osd->snap_sleep_lock);
+	pg->osd->snap_sleep_timer.cancel_event(wakeup);
+	wakeup = nullptr;
+      }
+    }
+    boost::statechart::result react(const SnapTrimTimerReady &) {
+      wakeup = nullptr;
+      auto *pg = context< SnapTrimmer >().pg;
+      if (!pg->is_primary() || !pg->is_active() || !pg->is_clean() ||
+	  pg->scrubber.active) {
+	post_event(SnapTrim());
+	return transit< NotTrimming >();
+      } else {
+	if (slept)
+	  post_event(SnapTrim());
+	return transit< TrimmingObjects >();
+      }
+    }
+  };
+
+  struct WaitingOnReplicas : boost::statechart::state< WaitingOnReplicas, Trimming >, NamedState {
     typedef boost::mpl::list <
       boost::statechart::custom_reaction< SnapTrim >,
       boost::statechart::transition< Reset, NotTrimming >

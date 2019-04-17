@@ -5,6 +5,7 @@
 
 #include <mutex>
 #include "include/unordered_map.h"
+#include "global/global_init.h"
 #include "rgw_common.h"
 #include "rgw_client_io.h"
 #include "rgw_rest.h"
@@ -29,6 +30,7 @@ namespace rgw {
     rgw::LDAPHelper* ldh;
     RGWREST rest; // XXX needed for RGWProcessEnv
     RGWRados* store;
+    boost::intrusive_ptr<CephContext> cct;
 
   public:
     RGWLib() : fec(nullptr), fe(nullptr), olog(nullptr), store(nullptr)
@@ -60,7 +62,11 @@ namespace rgw {
     RGWLibIO(const RGWUserInfo &_user_info)
       : user_info(_user_info) {}
 
-    virtual void init_env(CephContext *cct) {}
+
+    int init_env(CephContext *cct) override {
+      env.init(cct);
+      return 0;
+    }
 
     const RGWUserInfo& get_user() {
       return user_info;

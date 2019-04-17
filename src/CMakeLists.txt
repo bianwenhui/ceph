@@ -212,6 +212,7 @@ endif(HAVE_GOOD_YASM_ELF64)
 set(libcommon_files
   ${CMAKE_BINARY_DIR}/src/include/ceph_ver.h
   ceph_ver.c
+  common/AsyncOpTracker.cc
   common/DecayCounter.cc
   common/LogClient.cc
   common/LogEntry.cc
@@ -463,6 +464,7 @@ install(TARGETS ceph-monstore-tool DESTINATION bin)
 
 add_executable(ceph-objectstore-tool
   tools/ceph_objectstore_tool.cc
+  tools/rebuild_mondb.cc
   tools/RadosDump.cc
   $<TARGET_OBJECTS:common_util_obj>)
 target_link_libraries(ceph-objectstore-tool tcmalloc osd os global ${Boost_PROGRAM_OPTIONS_LIBRARY} fuse dl)
@@ -474,6 +476,7 @@ set(rados_srcs
   tools/RadosDump.cc
   tools/rados/RadosImport.cc
   tools/rados/PoolDump.cc
+  common/util.cc
   common/obj_bencher.cc)
 add_executable(rados ${rados_srcs})
 target_link_libraries(rados librados global ${BLKID_LIBRARIES} ${CMAKE_DL_LIBS} libradosstriper)
@@ -965,16 +968,17 @@ endif(${ENABLE_SHARED})
   target_link_libraries(mount.ceph keyutils)
 
   install(TARGETS ceph-syn DESTINATION bin)
-  install(TARGETS mount.ceph DESTINATION sbin)
+  install(TARGETS mount.ceph DESTINATION ${CMAKE_INSTALL_SBINDIR})
 
   if(HAVE_LIBFUSE)
     set(ceph_fuse_srcs
       ceph_fuse.cc
       client/fuse_ll.cc)
     add_executable(ceph-fuse ${ceph_fuse_srcs})
-    target_link_libraries(ceph-fuse ${FUSE_LIBRARIES} client global)
+    target_link_libraries(ceph-fuse ${ALLOC_LIBS} ${FUSE_LIBRARIES} client global)
     set_target_properties(ceph-fuse PROPERTIES COMPILE_FLAGS "-I${FUSE_INCLUDE_DIRS}")
     install(TARGETS ceph-fuse DESTINATION bin)
+    install(PROGRAMS mount.fuse.ceph DESTINATION ${CMAKE_INSTALL_SBINDIR})
   endif(HAVE_LIBFUSE)
 endif(WITH_LIBCEPHFS)
 
@@ -1003,6 +1007,7 @@ if(${WITH_RBD})
     tools/rbd_mirror/ImageReplayer.cc
     tools/rbd_mirror/ImageDeleter.cc
     tools/rbd_mirror/ImageSync.cc
+    tools/rbd_mirror/ImageSyncThrottler.cc
     tools/rbd_mirror/Mirror.cc
     tools/rbd_mirror/PoolWatcher.cc
     tools/rbd_mirror/Replayer.cc
@@ -1099,10 +1104,6 @@ endif(${WITH_KVS})
 
 if(${WITH_RADOSGW})
 
-  if(${HAVE_OPENLDAP})
-    set(rgw_ldap_srcs rgw/rgw_ldap.cc)
-  endif(${HAVE_OPENLDAP})
-
   set(rgw_a_srcs
     rgw/rgw_acl.cc
     rgw/rgw_acl_s3.cc
@@ -1124,7 +1125,7 @@ if(${WITH_RADOSGW})
     rgw/rgw_http_client.cc
     rgw/rgw_json_enc.cc
     rgw/rgw_keystone.cc
-    ${rgw_ldap_srcs}
+    rgw/rgw_ldap.cc
     rgw/rgw_loadgen.cc
     rgw/rgw_log.cc
     rgw/rgw_metadata.cc
@@ -1175,15 +1176,22 @@ if(${WITH_RADOSGW})
 
   set(civetweb_common_files civetweb/src/civetweb.c)
   add_library(civetweb_common_objs OBJECT ${civetweb_common_files})
-  target_include_directories(civetweb_common_objs PUBLIC
+  target_include_directories(civetweb_common_objs PRIVATE
 	"${CMAKE_SOURCE_DIR}/src/civetweb/include")
-  if(HAVE_OPENSSL)
   set_property(TARGET civetweb_common_objs
-	       APPEND PROPERTY COMPILE_DEFINITIONS NO_SSL_DL=1)
-  target_include_directories(civetweb_common_objs PUBLIC
-	"${OPENSSL_INCLUDE_DIR}")
-  else(HAVE_OPENSSL)
-  endif(HAVE_OPENSSL)
+    APPEND PROPERTY COMPILE_DEFINITIONS USE_IPV6=1)
+  if(USE_OPENSSL)
+    set_property(TARGET civetweb_common_objs
+      APPEND PROPERTY COMPILE_DEFINITIONS NO_SSL_DL=1)
+    target_include_directories(civetweb_common_objs PRIVATE
+      "${SSL_INCLUDE_DIR}")
+  endif(USE_OPENSSL)
+  if (LIBSSL_SONAME)
+    set_property(TARGET civetweb_common_objs
+      APPEND PROPERTY COMPILE_DEFINITIONS SSL_LIB="${LIBSSL_SONAME}")
+    set_property(TARGET civetweb_common_objs
+      APPEND PROPERTY COMPILE_DEFINITIONS CRYPTO_LIB="${LIBCRYPTO_SONAME}")
+  endif()
 
   add_library(rgw_a STATIC ${rgw_a_srcs})
   target_link_libraries(rgw_a librados cls_rgw_client cls_refcount_client

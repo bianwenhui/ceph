@@ -200,8 +200,11 @@ class RGWRealm:
         log(20, 'current meta sync status=', meta_sync_status_json)
         sync_status = json.loads(meta_sync_status_json)
         
-        global_sync_status=sync_status['sync_status']['info']['status']
-        num_shards=sync_status['sync_status']['info']['num_shards']
+        sync_info = sync_status['sync_status']['info']
+        global_sync_status = sync_info['status']
+        num_shards = sync_info['num_shards']
+        period = sync_info['period']
+        realm_epoch = sync_info['realm_epoch']
 
         sync_markers=sync_status['sync_status']['markers']
         log(20, 'sync_markers=', sync_markers)
@@ -211,7 +214,7 @@ class RGWRealm:
         for i in xrange(num_shards):
             markers[i] = sync_markers[i]['val']['marker']
 
-        return (num_shards, markers)
+        return period, realm_epoch, num_shards, markers
 
     def meta_master_log_status(self, master_zone):
         (mdlog_status_json, retcode) = master_zone.cluster.rgw_admin_ro('--rgw-realm=' + self.realm + ' mdlog status')
@@ -253,13 +256,16 @@ class RGWRealm:
 
         while True:
             log_status = self.meta_master_log_status(self.master_zone)
-            (num_shards, sync_status) = self.meta_sync_status(zone)
+            (period, realm_epoch, num_shards, sync_status) = self.meta_sync_status(zone)
 
-            log(20, 'log_status=', log_status)
-            log(20, 'sync_status=', sync_status)
-
-            if self.compare_meta_status(zone, log_status, sync_status):
-                break
+            if realm_epoch < self.current_realm_epoch:
+                log(1, 'zone %s is syncing realm epoch=%d, behind current realm epoch=%d',
+                    zone.zone_name, realm_epoch, self.current_realm_epoch)
+            else:
+                log(20, 'log_status=', log_status)
+                log(20, 'sync_status=', sync_status)
+                if self.compare_meta_status(zone, log_status, sync_status):
+                    break
 
             time.sleep(5)
 
@@ -302,10 +308,12 @@ class RGWRealm:
         if target_zone.zone_name == source_zone.zone_name:
             return None
 
+        cmd = '--rgw-realm=' + self.realm + ' bucket sync status --source-zone=' + source_zone.zone_name + ' --bucket=' + bucket_name
+        global user
+        if user.tenant is not None:
+            cmd += ' --tenant=' + user.tenant + ' --uid=' + user.uid
         while True:
-            (bucket_sync_status_json, retcode) = target_zone.cluster.rgw_admin_ro('--rgw-realm=' + self.realm +
-                                                                                ' bucket sync status --source-zone=' + source_zone.zone_name +
-                                                                                ' --bucket=' + bucket_name, check_retcode = False)
+            (bucket_sync_status_json, retcode) = target_zone.cluster.rgw_admin_ro(cmd, check_retcode = False)
             if retcode == 0:
                 break
 
@@ -338,8 +346,12 @@ class RGWRealm:
         return markers
 
     def bucket_source_log_status(self, source_zone, bucket_name):
+        cmd = '--rgw-realm=' + self.realm + ' bilog status --bucket=' + bucket_name
+        global user
+        if user.tenant is not None:
+            cmd += ' --tenant=' + user.tenant + ' --uid=' + user.uid
         source_cluster = source_zone.cluster
-        (bilog_status_json, retcode) = source_cluster.rgw_admin_ro('--rgw-realm=' + self.realm + ' bilog status --bucket=' + bucket_name)
+        (bilog_status_json, retcode) = source_cluster.rgw_admin_ro(cmd)
         bilog_status = json.loads(bilog_status_json)
 
         m={}
@@ -439,23 +451,37 @@ class RGWRealm:
         log(5, 'creating user uid=', user.uid)
         cmd = build_cmd('--uid', user.uid, '--display-name', user.display_name,
                         '--access-key', user.access_key, '--secret', user.secret)
+        if user.tenant is not None:
+            cmd += ' --tenant ' + user.tenant
         self.master_zone.cluster.rgw_admin('--rgw-realm=' + self.realm + ' user create ' + cmd)
 
         if wait_meta:
             self.meta_checkpoint()
 
+    def parse_current_period(self, period_json):
+        period = json.loads(period_json)
+        self.current_realm_epoch = period['realm_epoch']
+
+    def init_current_period(self):
+        (period_json, retcode) = self.master_zone.cluster.rgw_admin('--rgw-realm=' + self.realm + ' period get')
+        self.parse_current_period(period_json)
+
     def set_master_zone(self, zone):
         (zg_json, retcode) = zone.cluster.rgw_admin('--rgw-realm=' + self.realm + ' --rgw-zonegroup=' + zone.zg + ' --rgw-zone=' + zone.zone_name + ' zone modify --master=1')
         (period_json, retcode) = zone.cluster.rgw_admin('--rgw-realm=' + self.realm + ' period update --commit')
+        self.parse_current_period(period_json)
 	self.master_zone = zone
+        # wait for reconfiguration, so that later metadata requests go to the new master
+        time.sleep(5)
 
 
 class RGWUser:
-    def __init__(self, uid, display_name, access_key, secret):
+    def __init__(self, uid, display_name, access_key, secret, tenant):
         self.uid = uid
         self.display_name = display_name
         self.access_key = access_key
         self.secret = secret
+        self.tenant = tenant
 
 def gen_access_key():
      return ''.join(random.SystemRandom().choice(string.ascii_uppercase + string.digits) for _ in range(16))
@@ -479,7 +505,7 @@ class RGWMulti:
         for i in xrange(num_clusters):
             self.clusters[i] = RGWCluster(i + 1, self.base_port + i)
 
-    def setup(self, bootstrap):
+    def setup(self, bootstrap, tenant):
         global realm
         global realm_credentials
         global user
@@ -499,9 +525,9 @@ class RGWMulti:
             for i in xrange(0, self.num_clusters):
                 realm.add_zone(self.clusters[i], 'us', 'us-' + str(i + 1), (i == 0))
 
-        realm.meta_checkpoint()
+        realm.init_current_period()
 
-        user = RGWUser('tester', '"Test User"', gen_access_key(), gen_secret())
+        user = RGWUser('tester', '"Test User"', gen_access_key(), gen_secret(), tenant)
         realm.create_user(user)
 
         realm.meta_checkpoint()
@@ -725,16 +751,17 @@ def test_multi_period_incremental_sync():
         from nose.plugins.skip import SkipTest
         raise SkipTest("test_multi_period_incremental_sync skipped. Requires 3 or more clusters.")
 
-    buckets, zone_bucket = create_bucket_per_zone()
+    all_zones = realm.get_zones()
 
-    all_zones = []
-    for z in zone_bucket:
-        all_zones.append(z)
+    # create a bucket in each zone
+    buckets = []
+    for zone in all_zones:
+        conn = zone.get_connection(user)
+        bucket_name = gen_bucket_name()
+        log(1, 'create bucket zone=', zone.zone_name, ' name=', bucket_name)
+        bucket = conn.create_bucket(bucket_name)
+        buckets.append(bucket_name)
 
-    for zone, bucket_name in zone_bucket.iteritems():
-        for objname in [ 'p1', '_p1' ]:
-            k = new_key(zone, bucket_name, objname)
-            k.set_contents_from_string('asdasd')
     realm.meta_checkpoint()
 
     # kill zone 3 gateway to freeze sync status to incremental in first period
@@ -744,12 +771,15 @@ def test_multi_period_incremental_sync():
     # change master to zone 2 -> period 2
     realm.set_master_zone(realm.get_zone('us-2'))
 
-    for zone, bucket_name in zone_bucket.iteritems():
+    # create another bucket in each zone, except for z3
+    for zone in all_zones:
         if zone == z3:
             continue
-        for objname in [ 'p2', '_p2' ]:
-            k = new_key(zone, bucket_name, objname)
-            k.set_contents_from_string('qweqwe')
+        conn = zone.get_connection(user)
+        bucket_name = gen_bucket_name()
+        log(1, 'create bucket zone=', zone.zone_name, ' name=', bucket_name)
+        bucket = conn.create_bucket(bucket_name)
+        buckets.append(bucket_name)
 
     # wait for zone 1 to sync
     realm.zone_meta_checkpoint(realm.get_zone('us-1'))
@@ -757,25 +787,22 @@ def test_multi_period_incremental_sync():
     # change master back to zone 1 -> period 3
     realm.set_master_zone(realm.get_zone('us-1'))
 
-    for zone, bucket_name in zone_bucket.iteritems():
+    for zone in all_zones:
         if zone == z3:
             continue
-        for objname in [ 'p3', '_p3' ]:
-            k = new_key(zone, bucket_name, objname)
-            k.set_contents_from_string('zxczxc')
+        conn = zone.get_connection(user)
+        bucket_name = gen_bucket_name()
+        log(1, 'create bucket zone=', zone.zone_name, ' name=', bucket_name)
+        bucket = conn.create_bucket(bucket_name)
+        buckets.append(bucket_name)
 
     # restart zone 3 gateway and wait for sync
     z3.cluster.start_rgw()
     realm.meta_checkpoint()
 
-    # verify that we end up with the same objects
-    for source_zone, bucket in zone_bucket.iteritems():
-        for target_zone in all_zones:
-            if source_zone.zone_name == target_zone.zone_name:
-                continue
-
-            realm.zone_bucket_checkpoint(target_zone, source_zone, bucket.name)
-
+    # verify that we end up with the same buckets
+    for bucket_name in buckets:
+        for source_zone, target_zone in itertools.combinations(all_zones, 2):
             check_bucket_eq(source_zone, target_zone, bucket)
 
 # TODO: test this in isolation, so it doesn't have side effects on other tests
@@ -803,6 +830,7 @@ def init(parse_args):
                                          'num_zones': 3,
                                          'no_bootstrap': 'false',
                                          'log_level': 20,
+                                         'tenant': None,
                                          })
     try:
         path = os.environ['RGW_MULTI_TEST_CONF']
@@ -824,6 +852,7 @@ def init(parse_args):
     parser.add_argument('--num-zones', type=int, default=cfg.getint(section, 'num_zones'))
     parser.add_argument('--no-bootstrap', action='store_true', default=cfg.getboolean(section, 'no_bootstrap'))
     parser.add_argument('--log-level', type=int, default=cfg.getint(section, 'log_level'))
+    parser.add_argument('--tenant', type=str, default=cfg.get(section, 'tenant'))
 
     argv = []
 
@@ -839,7 +868,7 @@ def init(parse_args):
 
     rgw_multi = RGWMulti(int(args.num_zones))
 
-    rgw_multi.setup(not args.no_bootstrap)
+    rgw_multi.setup(not args.no_bootstrap, args.tenant)
 
 
 def setup_module():

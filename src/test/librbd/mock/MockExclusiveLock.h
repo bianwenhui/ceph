@@ -15,10 +15,12 @@ namespace librbd {
 struct MockExclusiveLock {
   MOCK_CONST_METHOD0(is_lock_owner, bool());
 
-  MOCK_METHOD1(assert_header_locked, void(librados::ObjectWriteOperation *));
-
   MOCK_METHOD2(init, void(uint64_t features, Context*));
   MOCK_METHOD1(shut_down, void(Context*));
+
+  MOCK_METHOD1(request_lock, void(Context *));
+
+  MOCK_METHOD0(reacquire_lock, void());
 };
 
 } // namespace librbd

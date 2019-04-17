@@ -28,7 +28,6 @@
 
 #define CEPH_INO_ROOT   1
 #define CEPH_INO_CEPH   2       /* hidden .ceph dir */
-#define CEPH_INO_DOTDOT 3	/* used by ceph fuse for parent (..) */
 #define CEPH_INO_LOST_AND_FOUND 4	/* reserved ino for use in recovery */
 
 /* arbitrary limit on max # of monitors (cluster of 3 is typical) */
@@ -379,6 +378,20 @@ extern const char *ceph_mds_op_name(int op);
 #define CEPH_SETATTR_CTIME	(1 << 6)
 #define CEPH_SETATTR_MTIME_NOW	(1 << 7)
 #define CEPH_SETATTR_ATIME_NOW	(1 << 8)
+
+/*
+ * open request flags
+ */
+#define CEPH_O_RDONLY          00000000
+#define CEPH_O_WRONLY          00000001
+#define CEPH_O_RDWR            00000002
+#define CEPH_O_CREAT           00000100
+#define CEPH_O_EXCL            00000200
+#define CEPH_O_TRUNC           00001000
+#define CEPH_O_DIRECTORY       00200000
+#define CEPH_O_NOFOLLOW        00400000
+
+int ceph_flags_sys2wire(int flags);
 
 /*
  * Ceph setxattr request flags.

@@ -8,7 +8,7 @@ AC_PREREQ(2.59)
 # VERSION define is not used by the code.  It gets a version string
 # from 'git describe'; see src/ceph_ver.[ch]
 
-AC_INIT([ceph], [10.2.2], [ceph-devel@vger.kernel.org])
+AC_INIT([ceph], [10.2.11], [ceph-devel@vger.kernel.org])
 
 AX_CXX_COMPILE_STDCXX_11(, mandatory)
 
@@ -51,7 +51,7 @@ AM_PROG_LIBTOOL
 AM_PROG_AS
 
 
-AM_INIT_AUTOMAKE([foreign parallel-tests tar-ustar])
+AM_INIT_AUTOMAKE([foreign parallel-tests tar-pax])
 # enable make V=0 (if automake >1.11)
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
@@ -531,6 +531,42 @@ AS_IF([test "$RADOSGW" = "1"],
                             AC_DEFINE([HAVE_CURL_MULTI_WAIT], [1], [Define if have curl_multi_wait()]))
               ])
 
+AS_IF([test "$RADOSGW" = "1"],  [
+    AX_CHECK_OPENSSL([],
+        [AC_MSG_FAILURE([radosgw selected but OpenSSL not found])])
+AC_MSG_NOTICE([radosgw: openssl INCLUDES $OPENSSL_INCLUDES LIBS $OPENSSL_LIBS])
+AC_MSG_CHECKING(for radosgw/civetweb: sonames for openssl libraries)
+  saved_LIBS="${LIBS}"
+  LIBS="$OPENSSL_LIBS"
+  AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <openssl/ssl.h>
+#include <openssl/evp.h>], [SSL *s = 0;printf ("%p %d\n", (void*)EVP_md5(), SSL_get_fd(s))])],
+      [AC_MSG_RESULT([linked])
+eval `$OBJDUMP -p ./conftest$ac_exeext | sed -n 's/^  NEEDED  *libssl/LIBSSL_SONAME=libssl/p;
+s/^  NEEDED  *libcrypto/LIBCRYPTO_SONAME=libcrypto/p'`],
+      AC_MSG_RESULT([problem looking up sonames]))
+  LIBS="${saved_LIBS}"
+AC_MSG_NOTICE([radosgw: openssl sonames $LIBSSL_SONAME $LIBCRYPTO_SONAME])])
+SONAME_DEFINES=""
+AS_IF([test "x$LIBSSL_SONAME" != x], [
+SONAME_DEFINES="$SONAME_DEFINES -DSSL_LIB=\\"'"'"$LIBSSL_SONAME\\"'"'""
+])
+AS_IF([test "x$LIBCRYPTO_SONAME" != x], [
+SONAME_DEFINES="$SONAME_DEFINES -DCRYPTO_LIB=\\"'"'"$LIBCRYPTO_SONAME\\"'"'""
+])
+AC_SUBST(SONAME_DEFINES)
+
+AS_IF([test "$RADOSGW" = "1"],
+      [AC_MSG_CHECKING(if curl links with openssl)
+      AC_CHECK_PROG(CURL_CONFIG, curl-config, yes)
+      if test x"${CURL_CONFIG}" == x"yes"; then
+         if curl-config --configure | grep with-ssl; then
+            AC_DEFINE([WITH_CURL_OPENSSL], [1], [Define if curl is linked with ssl])
+         fi
+      else
+        AC_MSG_WARN([curl-config not found, radosgw's outbound ssl requests may be unreliable])
+      fi
+])
+
 # fuse?
 AC_ARG_WITH([fuse],
             [AS_HELP_STRING([--without-fuse], [disable FUSE userspace client])],
@@ -710,6 +746,7 @@ if test "x$enable_cephfs_java" = "xyes"; then
 	# Setup output var
 	AC_SUBST(JDK_CPPFLAGS)
 fi
+AM_CONDITIONAL(HAVE_JAVAH, [test -n "$JAVAH"])
 AM_CONDITIONAL(HAVE_JUNIT4, [test "$have_junit4" = "1"])
 
 #
@@ -1356,7 +1393,6 @@ AC_CONFIG_HEADERS([src/acconfig.h])
 AC_CONFIG_FILES([Makefile
 	src/Makefile
 	src/ocf/Makefile
-	src/ocf/ceph
 	src/ocf/rbd
 	src/java/Makefile
 	systemd/Makefile

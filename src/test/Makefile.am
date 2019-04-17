@@ -1,3 +1,40 @@
+EXTRA_DIST += \
+	test/CMakeLists.txt \
+	test/ObjectMap/CMakeLists.txt \
+	test/bench/CMakeLists.txt \
+	test/cls_hello/CMakeLists.txt \
+	test/cls_lock/CMakeLists.txt \
+	test/cls_log/CMakeLists.txt \
+	test/cls_numops/CMakeLists.txt \
+	test/cls_rbd/CMakeLists.txt \
+	test/cls_refcount/CMakeLists.txt \
+	test/cls_replica_log/CMakeLists.txt \
+	test/cls_rgw/CMakeLists.txt \
+	test/cls_statelog/CMakeLists.txt \
+	test/cls_version/CMakeLists.txt \
+	test/common/CMakeLists.txt \
+	test/crush/CMakeLists.txt \
+	test/encoding/CMakeLists.txt \
+	test/filestore/CMakeLists.txt \
+	test/fs/CMakeLists.txt \
+	test/journal/CMakeLists.txt \
+	test/libcephfs/CMakeLists.txt \
+	test/librados/CMakeLists.txt \
+	test/librados_test_stub/CMakeLists.txt \
+	test/libradosstriper/CMakeLists.txt \
+	test/librbd/CMakeLists.txt \
+	test/mds/CMakeLists.txt \
+	test/mon/CMakeLists.txt \
+	test/msgr/CMakeLists.txt \
+	test/objectstore/CMakeLists.txt \
+	test/os/CMakeLists.txt \
+	test/osd/CMakeLists.txt \
+	test/osdc/CMakeLists.txt \
+	test/pybind/CMakeLists.txt \
+	test/rbd_mirror/CMakeLists.txt \
+	test/rgw/CMakeLists.txt \
+	test/system/CMakeLists.txt
+
 include test/erasure-code/Makefile.am
 include test/messenger/Makefile.am
 include test/compressor/Makefile.am
@@ -84,6 +121,8 @@ check_SCRIPTS += \
        test/mon/test_pool_quota.sh \
 	test/osd/osd-scrub-repair.sh \
 	test/osd/osd-scrub-snaps.sh \
+	test/osd/osd-scrub-test.sh \
+	test/osd/osd-recovery-scrub.sh \
 	test/osd/osd-config.sh \
 	test/osd/osd-reuse-id.sh \
 	test/osd/osd-bench.sh \
@@ -93,7 +132,7 @@ check_SCRIPTS += \
 	test/mon/mon-handle-forward.sh \
 	test/libradosstriper/rados-striper.sh \
 	test/test_objectstore_memstore.sh \
-        test/test_pidfile.sh
+	test/test_subman.sh
 
 EXTRA_DIST += \
 	$(srcdir)/test/python/brag-client/setup.py \
@@ -251,7 +290,7 @@ unittest_str_list_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL)
 check_TESTPROGRAMS += unittest_str_list
 
 unittest_log_SOURCES = log/test.cc
-unittest_log_LDADD = $(LIBCOMMON) $(UNITTEST_LDADD)
+unittest_log_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL)
 unittest_log_CXXFLAGS = $(UNITTEST_CXXFLAGS) -O2
 check_TESTPROGRAMS += unittest_log
 
@@ -306,7 +345,7 @@ unittest_bufferlist_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 check_TESTPROGRAMS += unittest_bufferlist
 
 unittest_xlist_SOURCES = test/test_xlist.cc
-unittest_xlist_LDADD = $(UNITTEST_LDADD) $(LIBCOMMON)
+unittest_xlist_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL)
 unittest_xlist_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 check_TESTPROGRAMS += unittest_xlist
 
@@ -386,7 +425,7 @@ unittest_safe_io_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 check_TESTPROGRAMS += unittest_safe_io
 
 unittest_heartbeatmap_SOURCES = test/heartbeat_map.cc
-unittest_heartbeatmap_LDADD = $(LIBCOMMON) $(UNITTEST_LDADD) $(CEPH_GLOBAL)
+unittest_heartbeatmap_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL)
 unittest_heartbeatmap_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 check_TESTPROGRAMS += unittest_heartbeatmap
 
@@ -409,7 +448,7 @@ unittest_ipaddr_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 check_TESTPROGRAMS += unittest_ipaddr
 
 unittest_texttable_SOURCES = test/test_texttable.cc
-unittest_texttable_LDADD = $(LIBCOMMON) $(UNITTEST_LDADD)
+unittest_texttable_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL)
 unittest_texttable_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 check_TESTPROGRAMS += unittest_texttable
 
@@ -438,7 +477,7 @@ unittest_interval_set_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL)
 check_TESTPROGRAMS += unittest_interval_set
 
 unittest_subprocess_SOURCES = test/test_subprocess.cc
-unittest_subprocess_LDADD = $(LIBCOMMON) $(UNITTEST_LDADD)
+unittest_subprocess_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL)
 unittest_subprocess_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 check_PROGRAMS += unittest_subprocess
 
@@ -452,7 +491,8 @@ check_SCRIPTS += test/pybind/test_ceph_daemon.py
 
 ceph_test_objectcacher_stress_SOURCES = \
 	test/osdc/object_cacher_stress.cc \
-	test/osdc/FakeWriteback.cc
+	test/osdc/FakeWriteback.cc \
+	test/osdc/MemWriteback.cc
 ceph_test_objectcacher_stress_LDADD = $(LIBOSDC) $(CEPH_GLOBAL)
 bin_DEBUGPROGRAMS += ceph_test_objectcacher_stress
 
@@ -484,11 +524,13 @@ noinst_HEADERS += \
 	test/objectstore/workload_generator.h \
 	test/kv_store_bench.h \
 	test/librados/test.h \
+	test/librados/test_common.h \
 	test/librados/TestCase.h \
 	test/libradosstriper/TestCase.h \
 	test/ObjectMap/KeyValueDBMemory.h \
 	test/omap_bench.h \
 	test/osdc/FakeWriteback.h \
+	test/osdc/MemWriteback.h \
 	test/osd/Object.h \
 	test/osd/RadosModel.h \
 	test/osd/TestOpStat.h \

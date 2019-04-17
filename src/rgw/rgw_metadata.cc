@@ -3,6 +3,7 @@
 
 #include <boost/intrusive_ptr.hpp>
 #include "common/ceph_json.h"
+#include "common/errno.h"
 #include "rgw_metadata.h"
 #include "rgw_coroutine.h"
 #include "cls/version/cls_version_types.h"
@@ -12,6 +13,8 @@
 
 #include "rgw_cr_rados.h"
 #include "rgw_boost_asio_yield.h"
+
+#include "include/assert.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -147,11 +150,17 @@ int RGWMetadataLog::list_entries(void *handle,
     return 0;
   }
 
+  std::string next_marker;
   int ret = store->time_log_list(ctx->cur_oid, ctx->from_time, ctx->end_time,
 				 max_entries, entries, ctx->marker,
-				 last_marker, truncated);
+				 &next_marker, truncated);
   if ((ret < 0) && (ret != -ENOENT))
     return ret;
+
+  ctx->marker = std::move(next_marker);
+  if (last_marker) {
+    *last_marker = ctx->marker;
+  }
 
   if (ret == -ENOENT)
     *truncated = false;
@@ -176,71 +185,35 @@ int RGWMetadataLog::get_info(int shard_id, RGWMetadataLogInfo *info)
   return 0;
 }
 
-static void _mdlog_info_completion(librados::completion_t cb, void *arg);
-
-class RGWMetadataLogInfoCompletion : public RefCountedObject {
-  RGWMetadataLogInfo *pinfo;
-  RGWCompletionManager *completion_manager;
-  void *user_info;
-  int *pret;
-  cls_log_header header;
-  librados::IoCtx io_ctx;
-  librados::AioCompletion *completion;
-
-public:
-  RGWMetadataLogInfoCompletion(RGWMetadataLogInfo *_pinfo, RGWCompletionManager *_cm, void *_uinfo, int *_pret) :
-                                               pinfo(_pinfo), completion_manager(_cm), user_info(_uinfo), pret(_pret) {
-    completion = librados::Rados::aio_create_completion((void *)this, _mdlog_info_completion, NULL);
-  }
-
-  ~RGWMetadataLogInfoCompletion() {
-    completion->release();
-  }
-
-  void finish(librados::completion_t cb) {
-    *pret = completion->get_return_value();
-    if (*pret >= 0) {
-      pinfo->marker = header.max_marker;
-      pinfo->last_update = header.max_time.to_real_time();
-    }
-    completion_manager->complete(NULL, user_info);
-    put();
-  }
-
-  librados::IoCtx& get_io_ctx() { return io_ctx; }
-
-  cls_log_header *get_header() {
-    return &header;
-  }
-
-  librados::AioCompletion *get_completion() {
-    return completion;
-  }
-};
-
 static void _mdlog_info_completion(librados::completion_t cb, void *arg)
 {
-  RGWMetadataLogInfoCompletion *infoc = (RGWMetadataLogInfoCompletion *)arg;
+  auto infoc = static_cast<RGWMetadataLogInfoCompletion *>(arg);
   infoc->finish(cb);
+  infoc->put(); // drop the ref from get_info_async()
 }
 
-int RGWMetadataLog::get_info_async(int shard_id, RGWMetadataLogInfo *info, RGWCompletionManager *completion_manager, void *user_info, int *pret)
+RGWMetadataLogInfoCompletion::RGWMetadataLogInfoCompletion(info_callback_t cb)
+  : completion(librados::Rados::aio_create_completion((void *)this, nullptr,
+                                                      _mdlog_info_completion)),
+    callback(cb)
+{
+}
+
+RGWMetadataLogInfoCompletion::~RGWMetadataLogInfoCompletion()
+{
+  completion->release();
+}
+
+int RGWMetadataLog::get_info_async(int shard_id, RGWMetadataLogInfoCompletion *completion)
 {
   string oid;
   get_shard_oid(shard_id, oid);
 
-  RGWMetadataLogInfoCompletion *req_completion = new RGWMetadataLogInfoCompletion(info, completion_manager, user_info, pret);
+  completion->get(); // hold a ref until the completion fires
 
-  req_completion->get();
-
-  int ret = store->time_log_info_async(req_completion->get_io_ctx(), oid, req_completion->get_header(), req_completion->get_completion());
-  if (ret < 0) {
-    return ret;
-  }
-
-  req_completion->put();
-
-  return 0;
+  return store->time_log_info_async(completion->get_io_ctx(), oid,
+                                    &completion->get_header(),
+                                    completion->get_completion());
 }
 
 int RGWMetadataLog::trim(int shard_id, const real_time& from_time, const real_time& end_time,
@@ -253,7 +226,7 @@ int RGWMetadataLog::trim(int shard_id, const real_time& from_time, const real_ti
 
   ret = store->time_log_trim(oid, from_time, end_time, start_marker, end_marker);
 
-  if (ret == -ENOENT)
+  if (ret == -ENOENT || ret == -ENODATA)
     ret = 0;
 
   return ret;
@@ -345,6 +318,7 @@ public:
 
 static RGWMetadataTopHandler md_top_handler;
 
+
 RGWMetadataManager::RGWMetadataManager(CephContext *_cct, RGWRados *_store)
   : cct(_cct), store(_store)
 {
@@ -361,95 +335,181 @@ RGWMetadataManager::~RGWMetadataManager()
   handlers.clear();
 }
 
+const std::string RGWMetadataLogHistory::oid = "meta.history";
+
 namespace {
 
-class FindAnyShardCR : public RGWCoroutine {
-  RGWRados *const store;
-  const RGWMetadataLog& mdlog;
-  const int num_shards;
-  int ret = 0;
+int read_history(RGWRados *store, RGWMetadataLogHistory *state,
+                 RGWObjVersionTracker *objv_tracker)
+{
+  RGWObjectCtx ctx{store};
+  auto& pool = store->get_zone_params().log_pool;
+  const auto& oid = RGWMetadataLogHistory::oid;
+  bufferlist bl;
+  int ret = rgw_get_system_obj(store, ctx, pool, oid, bl, objv_tracker, nullptr);
+  if (ret < 0) {
+    return ret;
+  }
+  try {
+    auto p = bl.begin();
+    state->decode(p);
+  } catch (buffer::error& e) {
+    ldout(store->ctx(), 1) << "failed to decode the mdlog history: "
+        << e.what() << dendl;
+    return -EIO;
+  }
+  return 0;
+}
+
+int write_history(RGWRados *store, const RGWMetadataLogHistory& state,
+                  RGWObjVersionTracker *objv_tracker, bool exclusive = false)
+{
+  bufferlist bl;
+  state.encode(bl);
+
+  auto& pool = store->get_zone_params().log_pool;
+  const auto& oid = RGWMetadataLogHistory::oid;
+  return rgw_put_system_obj(store, pool, oid, bl.c_str(), bl.length(),
+                            exclusive, objv_tracker, real_time{});
+}
+
+using Cursor = RGWPeriodHistory::Cursor;
+
+/// read the mdlog history and use it to initialize the given cursor
+class ReadHistoryCR : public RGWCoroutine {
+  RGWRados *store;
+  Cursor *cursor;
+  RGWObjVersionTracker *objv_tracker;
+  RGWMetadataLogHistory state;
  public:
-  FindAnyShardCR(RGWRados *store, const RGWMetadataLog& mdlog, int num_shards)
-    : RGWCoroutine(store->ctx()), store(store), mdlog(mdlog),
-      num_shards(num_shards) {}
+  ReadHistoryCR(RGWRados *store, Cursor *cursor,
+                RGWObjVersionTracker *objv_tracker)
+    : RGWCoroutine(store->ctx()), store(store), cursor(cursor),
+      objv_tracker(objv_tracker)
+  {}
 
   int operate() {
     reenter(this) {
-      // send stat requests for each shard in parallel
       yield {
-        auto async_rados = store->get_async_rados();
-        auto& pool = store->get_zone_params().log_pool;
-        auto oid = std::string{};
+        constexpr bool empty_on_enoent = false;
 
-        for (int i = 0; i < num_shards; i++) {
-          mdlog.get_shard_oid(i, oid);
-          auto obj = rgw_obj{pool, oid};
-          spawn(new RGWStatObjCR(async_rados, store, obj), true);
-        }
+        using ReadCR = RGWSimpleRadosReadCR<RGWMetadataLogHistory>;
+        call(new ReadCR(store->get_async_rados(), store,
+                        store->get_zone_params().log_pool,
+                        RGWMetadataLogHistory::oid,
+                        &state, empty_on_enoent, objv_tracker));
       }
-      drain_all();
-      // if any shards were found, return success
-      while (collect_next(&ret)) {
-        if (ret == 0) {
-          // TODO: cancel instead of waiting for the rest
-          return set_cr_done();
-        }
-        ret = 0; // collect_next() won't modify &ret unless it's a failure
+      if (retcode < 0) {
+        ldout(cct, 1) << "failed to read mdlog history: "
+            << cpp_strerror(retcode) << dendl;
+        return set_cr_error(retcode);
       }
-      // no shards found
-      set_retcode(-ENOENT);
-      return set_cr_error(-ENOENT);
+      *cursor = store->period_history->lookup(state.oldest_realm_epoch);
+      if (!*cursor) {
+        return set_cr_error(cursor->get_error());
+      }
+
+      ldout(cct, 10) << "read mdlog history with oldest period id="
+          << state.oldest_period_id << " realm_epoch="
+          << state.oldest_realm_epoch << dendl;
+      return set_cr_done();
     }
     return 0;
   }
 };
 
-// return true if any log shards exist for the given period
-int find_shards_for_period(RGWRados *store, const std::string& period_id)
+/// write the given cursor to the mdlog history
+class WriteHistoryCR : public RGWCoroutine {
+  RGWRados *store;
+  Cursor cursor;
+  RGWObjVersionTracker *objv;
+  RGWMetadataLogHistory state;
+ public:
+  WriteHistoryCR(RGWRados *store, const Cursor& cursor,
+                 RGWObjVersionTracker *objv)
+    : RGWCoroutine(store->ctx()), store(store), cursor(cursor), objv(objv)
+  {}
+
+  int operate() {
+    reenter(this) {
+      state.oldest_period_id = cursor.get_period().get_id();
+      state.oldest_realm_epoch = cursor.get_epoch();
+
+      yield {
+        using WriteCR = RGWSimpleRadosWriteCR<RGWMetadataLogHistory>;
+        call(new WriteCR(store->get_async_rados(), store,
+                         store->get_zone_params().log_pool,
+                         RGWMetadataLogHistory::oid, state, objv));
+      }
+      if (retcode < 0) {
+        ldout(cct, 1) << "failed to write mdlog history: "
+            << cpp_strerror(retcode) << dendl;
+        return set_cr_error(retcode);
+      }
+
+      ldout(cct, 10) << "wrote mdlog history with oldest period id="
+          << state.oldest_period_id << " realm_epoch="
+          << state.oldest_realm_epoch << dendl;
+      return set_cr_done();
+    }
+    return 0;
+  }
+};
+
+/// update the mdlog history to reflect trimmed logs
+class TrimHistoryCR : public RGWCoroutine {
+  RGWRados *store;
+  const Cursor cursor; //< cursor to trimmed period
+  RGWObjVersionTracker *objv; //< to prevent racing updates
+  Cursor next; //< target cursor for oldest log period
+  Cursor existing; //< existing cursor read from disk
+
+ public:
+  TrimHistoryCR(RGWRados *store, Cursor cursor, RGWObjVersionTracker *objv)
+    : RGWCoroutine(store->ctx()),
+      store(store), cursor(cursor), objv(objv), next(cursor)
+  {
+    next.next(); // advance past cursor
+  }
+
+  int operate() {
+    reenter(this) {
+      // read an existing history, and write the new history if it's newer
+      yield call(new ReadHistoryCR(store, &existing, objv));
+      if (retcode < 0) {
+        return set_cr_error(retcode);
+      }
+      // reject older trims with ECANCELED
+      if (cursor.get_epoch() < existing.get_epoch()) {
+        ldout(cct, 4) << "found oldest log epoch=" << existing.get_epoch()
+            << ", rejecting trim at epoch=" << cursor.get_epoch() << dendl;
+        return set_cr_error(-ECANCELED);
+      }
+      // overwrite with updated history
+      yield call(new WriteHistoryCR(store, next, objv));
+      if (retcode < 0) {
+        return set_cr_error(retcode);
+      }
+      return set_cr_done();
+    }
+    return 0;
+  }
+};
+
+// traverse all the way back to the beginning of the period history, and
+// return a cursor to the first period in a fully attached history
+Cursor find_oldest_period(RGWRados *store)
 {
   auto cct = store->ctx();
-  RGWMetadataLog mdlog(cct, store, period_id);
-  auto num_shards = cct->_conf->rgw_md_log_max_shards;
-
-  using FindAnyShardCRRef = boost::intrusive_ptr<FindAnyShardCR>;
-  auto cr = FindAnyShardCRRef{new FindAnyShardCR(store, mdlog, num_shards)};
-
-  RGWCoroutinesManager mgr(cct, nullptr);
-  int r = mgr.run(cr.get());
-  if (r < 0) {
-    return r;
-  }
-  return cr->get_ret_status();
-}
-
-RGWPeriodHistory::Cursor find_oldest_log_period(RGWRados *store)
-{
-  // search backwards through the period history for the first period with no
-  // log shard objects, and return its successor (some shards may be missing
-  // if they contain no metadata yet, so we need to check all shards)
   auto cursor = store->period_history->get_current();
-  auto oldest_log = cursor;
 
   while (cursor) {
-    // search for an existing log shard object for this period
-    int r = find_shards_for_period(store, cursor.get_period().get_id());
-    if (r == -ENOENT) {
-      ldout(store->ctx(), 10) << "find_oldest_log_period found no log shards "
-          "for period " << cursor.get_period().get_id() << "; returning "
-          "period " << oldest_log.get_period().get_id() << dendl;
-      return oldest_log;
-    }
-    if (r < 0) {
-      return RGWPeriodHistory::Cursor{r};
-    }
-    oldest_log = cursor;
-
     // advance to the period's predecessor
     if (!cursor.has_prev()) {
       auto& predecessor = cursor.get_period().get_predecessor();
       if (predecessor.empty()) {
         // this is the first period, so our logs must start here
-        ldout(store->ctx(), 10) << "find_oldest_log_period returning first "
+        ldout(cct, 10) << "find_oldest_period returning first "
             "period " << cursor.get_period().get_id() << dendl;
         return cursor;
       }
@@ -457,30 +517,112 @@ RGWPeriodHistory::Cursor find_oldest_log_period(RGWRados *store)
       RGWPeriod period;
       int r = store->period_puller->pull(predecessor, period);
       if (r < 0) {
-        return RGWPeriodHistory::Cursor{r};
+        return Cursor{r};
       }
       auto prev = store->period_history->insert(std::move(period));
       if (!prev) {
         return prev;
       }
-      ldout(store->ctx(), 10) << "find_oldest_log_period advancing to "
+      ldout(cct, 20) << "find_oldest_period advancing to "
           "predecessor period " << predecessor << dendl;
       assert(cursor.has_prev());
     }
     cursor.prev();
   }
-  ldout(store->ctx(), 10) << "find_oldest_log_period returning empty cursor" << dendl;
+  ldout(cct, 10) << "find_oldest_period returning empty cursor" << dendl;
   return cursor;
 }
 
 } // anonymous namespace
 
+Cursor RGWMetadataManager::init_oldest_log_period()
+{
+  // read the mdlog history
+  RGWMetadataLogHistory state;
+  RGWObjVersionTracker objv;
+  int ret = read_history(store, &state, &objv);
+
+  if (ret == -ENOENT) {
+    // initialize the mdlog history and write it
+    ldout(cct, 10) << "initializing mdlog history" << dendl;
+    auto cursor = find_oldest_period(store);
+    if (!cursor) {
+      return cursor;
+    }
+
+    // write the initial history
+    state.oldest_realm_epoch = cursor.get_epoch();
+    state.oldest_period_id = cursor.get_period().get_id();
+
+    constexpr bool exclusive = true; // don't overwrite
+    int ret = write_history(store, state, &objv, exclusive);
+    if (ret < 0 && ret != -EEXIST) {
+      ldout(cct, 1) << "failed to write mdlog history: "
+          << cpp_strerror(ret) << dendl;
+      return Cursor{ret};
+    }
+    return cursor;
+  } else if (ret < 0) {
+    ldout(cct, 1) << "failed to read mdlog history: "
+        << cpp_strerror(ret) << dendl;
+    return Cursor{ret};
+  }
+
+  // if it's already in the history, return it
+  auto cursor = store->period_history->lookup(state.oldest_realm_epoch);
+  if (cursor) {
+    return cursor;
+  }
+  // pull the oldest period by id
+  RGWPeriod period;
+  ret = store->period_puller->pull(state.oldest_period_id, period);
+  if (ret < 0) {
+    ldout(cct, 1) << "failed to read period id=" << state.oldest_period_id
+        << " for mdlog history: " << cpp_strerror(ret) << dendl;
+    return Cursor{ret};
+  }
+  // verify its realm_epoch
+  if (period.get_realm_epoch() != state.oldest_realm_epoch) {
+    ldout(cct, 1) << "inconsistent mdlog history: read period id="
+        << period.get_id() << " with realm_epoch=" << period.get_realm_epoch()
+        << ", expected realm_epoch=" << state.oldest_realm_epoch << dendl;
+    return Cursor{-EINVAL};
+  }
+  // attach the period to our history
+  return store->period_history->attach(std::move(period));
+}
+
+Cursor RGWMetadataManager::read_oldest_log_period() const
+{
+  RGWMetadataLogHistory state;
+  int ret = read_history(store, &state, nullptr);
+  if (ret < 0) {
+    ldout(store->ctx(), 1) << "failed to read mdlog history: "
+        << cpp_strerror(ret) << dendl;
+    return Cursor{ret};
+  }
+
+  ldout(store->ctx(), 10) << "read mdlog history with oldest period id="
+      << state.oldest_period_id << " realm_epoch="
+      << state.oldest_realm_epoch << dendl;
+
+  return store->period_history->lookup(state.oldest_realm_epoch);
+}
+
+RGWCoroutine* RGWMetadataManager::read_oldest_log_period_cr(Cursor *period,
+        RGWObjVersionTracker *objv) const
+{
+  return new ReadHistoryCR(store, period, objv);
+}
+
+RGWCoroutine* RGWMetadataManager::trim_log_period_cr(Cursor period,
+        RGWObjVersionTracker *objv) const
+{
+  return new TrimHistoryCR(store, period, objv);
+}
+
 int RGWMetadataManager::init(const std::string& current_period)
 {
-  if (store->is_meta_master()) {
-    // find our oldest log so we can tell other zones where to start their sync
-    oldest_log_period = find_oldest_log_period(store);
-  }
   // open a log for the current period
   current_log = get_log(current_period);
   return 0;
@@ -830,6 +972,10 @@ int RGWMetadataManager::store_in_heap(RGWMetadataHandler *handler, const string&
 
   rgw_bucket heap_pool(store->get_zone_params().metadata_heap);
 
+  if (heap_pool.name.empty()) {
+    return 0;
+  }
+
   RGWObjVersionTracker otracker;
   otracker.write_version = objv_tracker->write_version;
   string oid = heap_oid(handler, key, objv_tracker->write_version);
@@ -851,6 +997,10 @@ int RGWMetadataManager::remove_from_heap(RGWMetadataHandler *handler, const stri
   }
 
   rgw_bucket heap_pool(store->get_zone_params().metadata_heap);
+
+  if (heap_pool.name.empty()) {
+    return 0;
+  }
 
   string oid = heap_oid(handler, key, objv_tracker->write_version);
   rgw_obj obj(heap_pool, oid);
@@ -886,6 +1036,7 @@ int RGWMetadataManager::put_entry(RGWMetadataHandler *handler, const string& key
   ret = rgw_put_system_obj(store, bucket, oid,
                            bl.c_str(), bl.length(), exclusive,
                            objv_tracker, mtime, pattrs);
+
   if (ret < 0) {
     int r = remove_from_heap(handler, key, objv_tracker);
     if (r < 0) {

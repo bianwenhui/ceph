@@ -82,6 +82,7 @@ public:
   void set_stats(const rgw_user& user, rgw_bucket& bucket, RGWQuotaCacheStats& qs, RGWStorageStats& stats);
   int async_refresh(const rgw_user& user, rgw_bucket& bucket, RGWQuotaCacheStats& qs);
   void async_refresh_response(const rgw_user& user, rgw_bucket& bucket, RGWStorageStats& stats);
+  void async_refresh_fail(const rgw_user& user, rgw_bucket& bucket);
 
   class AsyncRefreshHandler {
   protected:
@@ -154,6 +155,14 @@ int RGWQuotaCache<T>::async_refresh(const rgw_user& user, rgw_bucket& bucket, RG
 }
 
 template<class T>
+void RGWQuotaCache<T>::async_refresh_fail(const rgw_user& user, rgw_bucket& bucket)
+{
+  ldout(store->ctx(), 20) << "async stats refresh response for bucket=" << bucket << dendl;
+
+  async_refcount->put();
+}
+
+template<class T>
 void RGWQuotaCache<T>::async_refresh_response(const rgw_user& user, rgw_bucket& bucket, RGWStorageStats& stats)
 {
   ldout(store->ctx(), 20) << "async stats refresh response for bucket=" << bucket << dendl;
@@ -221,9 +230,23 @@ public:
     uint64_t rounded_kb_added = rgw_rounded_objsize_kb(added_bytes);
     uint64_t rounded_kb_removed = rgw_rounded_objsize_kb(removed_bytes);
 
-    entry->stats.num_kb_rounded += (rounded_kb_added - rounded_kb_removed);
-    entry->stats.num_kb += (added_bytes - removed_bytes) / 1024;
-    entry->stats.num_objects += objs_delta;
+    if (((int64_t)(entry->stats.num_kb_rounded + rounded_kb_added - rounded_kb_removed)) >= 0) {
+      entry->stats.num_kb_rounded += (rounded_kb_added - rounded_kb_removed);
+    } else {
+      entry->stats.num_kb_rounded = 0;
+    }
+    
+    if (((int64_t)(entry->stats.num_kb + ((added_bytes - removed_bytes) / 1024))) >= 0) {
+      entry->stats.num_kb += (added_bytes - removed_bytes) / 1024;
+    } else {
+      entry->stats.num_kb = 0;
+    }
+    
+    if (((int64_t)(entry->stats.num_objects + objs_delta)) >= 0) {
+      entry->stats.num_objects += objs_delta;
+    } else {
+      entry->stats.num_objects = 0;
+    }
 
     return true;
   }
@@ -273,7 +296,8 @@ void BucketAsyncRefreshHandler::handle_response(int r)
 {
   if (r < 0) {
     ldout(store->ctx(), 20) << "AsyncRefreshHandler::handle_response() r=" << r << dendl;
-    return; /* nothing to do here */
+    cache->async_refresh_fail(user, bucket);
+    return;
   }
 
   RGWStorageStats bs;
@@ -374,7 +398,8 @@ void UserAsyncRefreshHandler::handle_response(int r)
 {
   if (r < 0) {
     ldout(store->ctx(), 20) << "AsyncRefreshHandler::handle_response() r=" << r << dendl;
-    return; /* nothing to do here */
+    cache->async_refresh_fail(user, bucket);
+    return;
   }
 
   cache->async_refresh_response(user, bucket, stats);
@@ -694,34 +719,18 @@ class RGWQuotaHandlerImpl : public RGWQuotaHandler {
     return 0;
   }
 public:
-  RGWQuotaHandlerImpl(RGWRados *_store, bool quota_threads) : store(_store), bucket_stats_cache(_store), user_stats_cache(_store, quota_threads) {
-    if (store->ctx()->_conf->rgw_bucket_default_quota_max_objects >= 0) {
-      def_bucket_quota.max_objects = store->ctx()->_conf->rgw_bucket_default_quota_max_objects;
-      def_bucket_quota.enabled = true;
-    }
-    if (store->ctx()->_conf->rgw_bucket_default_quota_max_size >= 0) {
-      def_bucket_quota.max_size_kb = store->ctx()->_conf->rgw_bucket_default_quota_max_size;
-      def_bucket_quota.enabled = true;
-    }
-    if (store->ctx()->_conf->rgw_user_default_quota_max_objects >= 0) {
-      def_user_quota.max_objects = store->ctx()->_conf->rgw_user_default_quota_max_objects;
-      def_user_quota.enabled = true;
-    }
-    if (store->ctx()->_conf->rgw_user_default_quota_max_size >= 0) {
-      def_user_quota.max_size_kb = store->ctx()->_conf->rgw_user_default_quota_max_size;
-      def_user_quota.enabled = true;
-    }
-  }
+  RGWQuotaHandlerImpl(RGWRados *_store, bool quota_threads) : store(_store),
+                                    bucket_stats_cache(_store),
+                                    user_stats_cache(_store, quota_threads) {}
+
   virtual int check_quota(const rgw_user& user, rgw_bucket& bucket,
                           RGWQuotaInfo& user_quota, RGWQuotaInfo& bucket_quota,
 			  uint64_t num_objs, uint64_t size) {
 
-    if (!bucket_quota.enabled && !user_quota.enabled && !def_bucket_quota.enabled && !def_user_quota.enabled)
+    if (!bucket_quota.enabled && !user_quota.enabled)
       return 0;
 
     uint64_t size_kb = rgw_rounded_objsize_kb(size);
-
-    RGWStorageStats bucket_stats;
 
     /*
      * we need to fetch bucket stats if the user quota is enabled, because the whole system relies
@@ -729,38 +738,26 @@ public:
      * get_stats() if we actually fetch that info and not rely on cached data
      */
 
-    int ret = bucket_stats_cache.get_stats(user, bucket, bucket_stats, bucket_quota);
-    if (ret < 0)
-      return ret;
-
     if (bucket_quota.enabled) {
+      RGWStorageStats bucket_stats;
+      int ret = bucket_stats_cache.get_stats(user, bucket, bucket_stats, bucket_quota);
+      if (ret < 0)
+        return ret;
+
       ret = check_quota("bucket", bucket_quota, bucket_stats, num_objs, size_kb);
       if (ret < 0)
-        return ret;
+	return ret;
     }
 
-    if (def_bucket_quota.enabled) {
-      ret = check_quota("def_bucket", def_bucket_quota, bucket_stats, num_objs, size_kb);
-      if (ret < 0)
-        return ret;
-    }
-
-    if (user_quota.enabled || def_user_quota.enabled) {
+    if (user_quota.enabled) {
       RGWStorageStats user_stats;
-
-      ret = user_stats_cache.get_stats(user, bucket, user_stats, user_quota);
+      int ret = user_stats_cache.get_stats(user, bucket, user_stats, user_quota);
       if (ret < 0)
         return ret;
 
-      if (user_quota.enabled) {
-	ret = check_quota("user", user_quota, user_stats, num_objs, size_kb);
-	if (ret < 0)
-	  return ret;
-      } else if (def_user_quota.enabled) {
-        ret = check_quota("def_user", def_user_quota, user_stats, num_objs, size_kb);
-        if (ret < 0)
-          return ret;
-      }
+      ret = check_quota("user", user_quota, user_stats, num_objs, size_kb);
+      if (ret < 0)
+	return ret;
     }
 
     return 0;

@@ -30,6 +30,7 @@ public:
   RGWGetObj_ObjStore_S3() {}
   ~RGWGetObj_ObjStore_S3() {}
 
+  int get_params() override;
   int send_response_data_error();
   int send_response_data(bufferlist& bl, off_t ofs, off_t len);
   void set_custom_http_response(int http_ret) { custom_http_ret = http_ret; }
@@ -162,6 +163,13 @@ public:
   int get_params();
   int get_data(bufferlist& bl);
   void send_response();
+
+  int validate_aws4_single_chunk(char *chunk_str,
+                                 char *chunk_data_str,
+                                 unsigned int chunk_data_size,
+                                 string chunk_signature);
+  int validate_and_unwrap_available_aws4_chunked_data(bufferlist& bl_in,
+                                                      bufferlist& bl_out);
 };
 
 struct post_part_field {
@@ -357,6 +365,14 @@ public:
   void end_response();
 };
 
+class RGWGetObjLayout_ObjStore_S3 : public RGWGetObjLayout {
+public:
+  RGWGetObjLayout_ObjStore_S3() {}
+  ~RGWGetObjLayout_ObjStore_S3() {}
+
+  void send_response();
+};
+
 class RGW_Auth_S3_Keystone_ValidateToken : public RGWHTTPClient {
 private:
   bufferlist rx_buffer;
@@ -414,7 +430,7 @@ private:
   static rgw::LDAPHelper* ldh;
 
   static int authorize_v2(RGWRados *store, struct req_state *s);
-  static int authorize_v4(RGWRados *store, struct req_state *s);
+  static int authorize_v4(RGWRados *store, struct req_state *s, bool force_boto2_compat = true);
   static int authorize_v4_complete(RGWRados *store, struct req_state *s,
 				  const string& request_payload,
 				  bool unsigned_payload);
@@ -445,11 +461,8 @@ public:
   RGWHandler_Auth_S3() : RGWHandler_REST() {}
   virtual ~RGWHandler_Auth_S3() {}
 
-  virtual int validate_bucket_name(const string& bucket) {
-    return 0;
-  }
-
-  virtual int validate_object_name(const string& bucket) { return 0; }
+  static int validate_bucket_name(const string& bucket);
+  static int validate_object_name(const string& bucket);
 
   virtual int init(RGWRados *store, struct req_state *s, RGWClientIO *cio);
   virtual int authorize() {

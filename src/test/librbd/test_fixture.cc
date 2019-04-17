@@ -60,7 +60,7 @@ int TestFixture::open_image(const std::string &image_name,
   *ictx = new librbd::ImageCtx(image_name.c_str(), "", NULL, m_ioctx, false);
   m_ictxs.insert(*ictx);
 
-  return (*ictx)->state->open();
+  return (*ictx)->state->open(false);
 }
 
 int TestFixture::snap_create(librbd::ImageCtx &ictx,
@@ -76,6 +76,11 @@ int TestFixture::snap_protect(librbd::ImageCtx &ictx,
 int TestFixture::flatten(librbd::ImageCtx &ictx,
                          librbd::ProgressContext &prog_ctx) {
   return ictx.operations->flatten(prog_ctx);
+}
+
+int TestFixture::resize(librbd::ImageCtx *ictx, uint64_t size){
+  librbd::NoOpProgressContext prog_ctx;
+  return ictx->operations->resize(size, prog_ctx);
 }
 
 void TestFixture::close_image(librbd::ImageCtx *ictx) {

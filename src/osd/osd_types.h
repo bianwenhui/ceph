@@ -61,17 +61,24 @@
 #define CEPH_OSD_FEATURE_INCOMPAT_PGMETA CompatSet::Feature(13, "pg meta object")
 
 
-/// max recovery priority for MBackfillReserve
-#define OSD_RECOVERY_PRIORITY_MAX 255u
-
-/// base recovery priority for MBackfillReserve
-#define OSD_RECOVERY_PRIORITY_BASE 230u
-
-/// base backfill priority for MBackfillReserve (degraded PG)
-#define OSD_BACKFILL_DEGRADED_PRIORITY_BASE 200u
+/// min recovery priority for MBackfillReserve
+#define OSD_RECOVERY_PRIORITY_MIN 0
 
 /// base backfill priority for MBackfillReserve
-#define OSD_BACKFILL_PRIORITY_BASE 1u
+#define OSD_BACKFILL_PRIORITY_BASE 100
+
+/// base backfill priority for MBackfillReserve (degraded PG)
+#define OSD_BACKFILL_DEGRADED_PRIORITY_BASE 140
+
+/// base recovery priority for MBackfillReserve
+#define OSD_RECOVERY_PRIORITY_BASE 180
+
+/// base backfill priority for MBackfillReserve (inactive PG)
+#define OSD_BACKFILL_INACTIVE_PRIORITY_BASE 220
+
+/// max recovery priority for MBackfillReserve
+#define OSD_RECOVERY_PRIORITY_MAX 255
+
 
 typedef hobject_t collection_list_handle_t;
 
@@ -922,6 +929,8 @@ inline ostream& operator<<(ostream& out, const osd_stat_t& s) {
 #define PG_STATE_UNDERSIZED    (1<<23) // pg acting < pool size
 #define PG_STATE_ACTIVATING   (1<<24) // pg is peered but not yet active
 #define PG_STATE_PEERED        (1<<25) // peered, cannot go active, can recover
+#define PG_STATE_SNAPTRIM      (1<<26) // trimming snaps
+#define PG_STATE_SNAPTRIM_WAIT (1<<27) // queued to trim snaps
 
 std::string pg_state_string(int state);
 std::string pg_vector_string(const vector<int32_t> &a);
@@ -3056,6 +3065,25 @@ ostream& operator<<(ostream& out, const osd_peer_stat_t &stat);
 // -----------------------------------------
 
 class ObjectExtent {
+  /**
+   * ObjectExtents are used for specifying IO behavior against RADOS
+   * objects when one is using the ObjectCacher.
+   *
+   * To use this in a real system, *every member* must be filled
+   * out correctly. In particular, make sure to initialize the
+   * oloc correctly, as its default values are deliberate poison
+   * and will cause internal ObjectCacher asserts.
+   *
+   * Similarly, your buffer_extents vector *must* specify a total
+   * size equal to your length. If the buffer_extents inadvertently
+   * contain less space than the length member specifies, you
+   * will get unintelligible asserts deep in the ObjectCacher.
+   *
+   * If you are trying to do testing and don't care about actual
+   * RADOS function, the simplest thing to do is to initialize
+   * the ObjectExtent (truncate_size can be 0), create a single entry
+   * in buffer_extents matching the length, and set oloc.pool to 0.
+   */
  public:
   object_t    oid;       // object id
   uint64_t    objectno;
@@ -3299,6 +3327,10 @@ struct object_info_t {
   // opportunistic checksums; may or may not be present
   __u32 data_digest;  ///< data crc32c
   __u32 omap_digest;  ///< omap crc32c
+  
+  // alloc hint attribute
+  uint64_t expected_object_size, expected_write_size;
+  uint32_t alloc_hint_flags;
 
   void copy_user_bits(const object_info_t& other);
 
@@ -3369,14 +3401,18 @@ struct object_info_t {
   explicit object_info_t()
     : user_version(0), size(0), flags((flag_t)0),
       truncate_seq(0), truncate_size(0),
-      data_digest(-1), omap_digest(-1)
+      data_digest(-1), omap_digest(-1),
+      expected_object_size(0), expected_write_size(0),
+      alloc_hint_flags(0)
   {}
 
   explicit object_info_t(const hobject_t& s)
     : soid(s),
       user_version(0), size(0), flags((flag_t)0),
       truncate_seq(0), truncate_size(0),
-      data_digest(-1), omap_digest(-1)
+      data_digest(-1), omap_digest(-1),
+      expected_object_size(0), expected_write_size(0),
+      alloc_hint_flags(0)
   {}
 
   explicit object_info_t(bufferlist& bl) {
@@ -3662,35 +3698,6 @@ public:
     rwstate.put_read(ls);
     rwstate.recovery_read_marker = false;
   }
-  void put_read(list<OpRequestRef> *to_wake) {
-    rwstate.put_read(to_wake);
-  }
-  void put_excl(list<OpRequestRef> *to_wake,
-		 bool *requeue_recovery,
-		 bool *requeue_snaptrimmer) {
-    rwstate.put_excl(to_wake);
-    if (rwstate.empty() && rwstate.recovery_read_marker) {
-      rwstate.recovery_read_marker = false;
-      *requeue_recovery = true;
-    }
-    if (rwstate.empty() && rwstate.snaptrimmer_write_marker) {
-      rwstate.snaptrimmer_write_marker = false;
-      *requeue_snaptrimmer = true;
-    }
-  }
-  void put_write(list<OpRequestRef> *to_wake,
-		 bool *requeue_recovery,
-		 bool *requeue_snaptrimmer) {
-    rwstate.put_write(to_wake);
-    if (rwstate.empty() && rwstate.recovery_read_marker) {
-      rwstate.recovery_read_marker = false;
-      *requeue_recovery = true;
-    }
-    if (rwstate.empty() && rwstate.snaptrimmer_write_marker) {
-      rwstate.snaptrimmer_write_marker = false;
-      *requeue_snaptrimmer = true;
-    }
-  }
   void put_lock_type(
     ObjectContext::RWState::State type,
     list<OpRequestRef> *to_wake,
@@ -3698,13 +3705,24 @@ public:
     bool *requeue_snaptrimmer) {
     switch (type) {
     case ObjectContext::RWState::RWWRITE:
-      return put_write(to_wake, requeue_recovery, requeue_snaptrimmer);
+      rwstate.put_write(to_wake);
+      break;
     case ObjectContext::RWState::RWREAD:
-      return put_read(to_wake);
+      rwstate.put_read(to_wake);
+      break;
     case ObjectContext::RWState::RWEXCL:
-      return put_excl(to_wake, requeue_recovery, requeue_snaptrimmer);
+      rwstate.put_excl(to_wake);
+      break;
     default:
       assert(0 == "invalid lock type");
+    }
+    if (rwstate.empty() && rwstate.recovery_read_marker) {
+      rwstate.recovery_read_marker = false;
+      *requeue_recovery = true;
+    }
+    if (rwstate.empty() && rwstate.snaptrimmer_write_marker) {
+      rwstate.snaptrimmer_write_marker = false;
+      *requeue_snaptrimmer = true;
     }
   }
   bool is_request_pending() {
@@ -4023,12 +4041,14 @@ struct ScrubMap {
     bool omap_digest_present:1;
     bool read_error:1;
     bool stat_error:1;
+    bool ec_hash_mismatch:1;
+    bool ec_size_mismatch:1;
 
     object() :
       // Init invalid size so it won't match if we get a stat EIO error
       size(-1), omap_digest(0), digest(0), nlinks(0), 
       negative(false), digest_present(false), omap_digest_present(false), 
-      read_error(false), stat_error(false) {}
+      read_error(false), stat_error(false), ec_hash_mismatch(false), ec_size_mismatch(false) {}
 
     void encode(bufferlist& bl) const;
     void decode(bufferlist::iterator& bl);
@@ -4037,15 +4057,38 @@ struct ScrubMap {
   };
   WRITE_CLASS_ENCODER(object)
 
-  map<hobject_t,object, hobject_t::BitwiseComparator> objects;
+  bool bitwise; // ephemeral, not encoded
+  map<hobject_t,object, hobject_t::ComparatorWithDefault> objects;
   eversion_t valid_through;
   eversion_t incr_since;
 
+  ScrubMap() : bitwise(true) {}
+  ScrubMap(bool bitwise)
+    : bitwise(bitwise), objects(hobject_t::ComparatorWithDefault(bitwise)) {}
+
   void merge_incr(const ScrubMap &l);
+  void insert(const ScrubMap &r) {
+    objects.insert(r.objects.begin(), r.objects.end());
+  }
+  void swap(ScrubMap &r) {
+    ::swap(objects, r.objects);
+    ::swap(valid_through, r.valid_through);
+    ::swap(incr_since, r.incr_since);
+  }
 
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bl, int64_t pool=-1);
   void dump(Formatter *f) const;
+  void reset_bitwise(bool new_bitwise) {
+    if (bitwise == new_bitwise)
+      return;
+    map<hobject_t, object, hobject_t::ComparatorWithDefault> new_objects(
+      objects.begin(),
+      objects.end(),
+      hobject_t::ComparatorWithDefault(new_bitwise));
+    ::swap(new_objects, objects);
+    bitwise = new_bitwise;
+  }
   static void generate_test_instances(list<ScrubMap*>& o);
 };
 WRITE_CLASS_ENCODER(ScrubMap::object)
@@ -4306,12 +4349,6 @@ struct obj_list_snap_response_t {
 };
 
 WRITE_CLASS_ENCODER(obj_list_snap_response_t)
-
-enum scrub_error_type {
-  CLEAN,
-  DEEP_ERROR,
-  SHALLOW_ERROR
-};
 
 // PromoteCounter
 

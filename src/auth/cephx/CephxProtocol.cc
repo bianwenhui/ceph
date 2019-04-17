@@ -60,7 +60,10 @@ bool cephx_build_service_ticket_blob(CephContext *cct, CephXSessionAuthInfo& inf
 	   << " ticket_info.ticket.name=" << ticket_info.ticket.name.to_str() << dendl;
   blob.secret_id = info.secret_id;
   std::string error;
-  encode_encrypt_enc_bl(cct, ticket_info, info.service_secret, blob.blob, error);
+  if (!info.service_secret.get_secret().length())
+    error = "invalid key";  // Bad key?
+  else
+    encode_encrypt_enc_bl(cct, ticket_info, info.service_secret, blob.blob, error);
   if (!error.empty()) {
     ldout(cct, -1) << "cephx_build_service_ticket_blob failed with error "
 	  << error << dendl;
@@ -293,7 +296,7 @@ CephXAuthorizer *CephXTicketHandler::build_authorizer(uint64_t global_id) const
 {
   CephXAuthorizer *a = new CephXAuthorizer(cct);
   a->session_key = session_key;
-  a->nonce = ((uint64_t)rand() << 32) + rand();
+  get_random_bytes((char*)&a->nonce, sizeof(a->nonce));
 
   __u8 authorizer_v = 1;
   ::encode(authorizer_v, a->bl);
@@ -301,6 +304,7 @@ CephXAuthorizer *CephXTicketHandler::build_authorizer(uint64_t global_id) const
   ::encode(service_id, a->bl);
 
   ::encode(ticket, a->bl);
+  a->base_bl = a->bl;
 
   CephXAuthorize msg;
   msg.nonce = a->nonce;
@@ -387,7 +391,9 @@ bool cephx_decode_ticket(CephContext *cct, KeyStore *keys, uint32_t service_id,
  */
 bool cephx_verify_authorizer(CephContext *cct, KeyStore *keys,
 			     bufferlist::iterator& indata,
-			     CephXServiceTicketInfo& ticket_info, bufferlist& reply_bl)
+			     CephXServiceTicketInfo& ticket_info,
+			     std::unique_ptr<AuthAuthorizerChallenge> *challenge,
+			     bufferlist& reply_bl)
 {
   __u8 authorizer_v;
   uint32_t service_id;
@@ -428,7 +434,10 @@ bool cephx_verify_authorizer(CephContext *cct, KeyStore *keys,
     }
   }
   std::string error;
-  decode_decrypt_enc_bl(cct, ticket_info, service_secret, ticket.blob, error);
+  if (!service_secret.get_secret().length())
+    error = "invalid key";  // Bad key?
+  else
+    decode_decrypt_enc_bl(cct, ticket_info, service_secret, ticket.blob, error);
   if (!error.empty()) {
     ldout(cct, 0) << "verify_authorizer could not decrypt ticket info: error: "
       << error << dendl;
@@ -449,6 +458,30 @@ bool cephx_verify_authorizer(CephContext *cct, KeyStore *keys,
     ldout(cct, 0) << "verify_authorizercould not decrypt authorize request with error: "
       << error << dendl;
     return false;
+  }
+
+  if (challenge) {
+    auto *c = static_cast<CephXAuthorizeChallenge*>(challenge->get());
+    if (!auth_msg.have_challenge || !c) {
+      c = new CephXAuthorizeChallenge;
+      challenge->reset(c);
+      get_random_bytes((char*)&c->server_challenge, sizeof(c->server_challenge));
+      ldout(cct,10) << __func__ << " adding server_challenge " << c->server_challenge
+		    << dendl;
+
+      encode_encrypt_enc_bl(cct, *c, ticket_info.session_key, reply_bl, error);
+      if (!error.empty()) {
+	ldout(cct, 10) << "verify_authorizer: encode_encrypt error: " << error << dendl;
+	return false;
+      }
+      return false;
+    }
+    ldout(cct, 10) << __func__ << " got server_challenge+1 "
+		   << auth_msg.server_challenge_plus_one
+		   << " expecting " << c->server_challenge + 1 << dendl;
+    if (c->server_challenge + 1 != auth_msg.server_challenge_plus_one) {
+      return false;
+    }
   }
 
   /*
@@ -487,3 +520,31 @@ bool CephXAuthorizer::verify_reply(bufferlist::iterator& indata)
   return true;
 }
 
+bool CephXAuthorizer::add_challenge(CephContext *cct, bufferlist& challenge)
+{
+  bl = base_bl;
+
+  CephXAuthorize msg;
+  msg.nonce = nonce;
+
+  auto p = challenge.begin();
+  if (!p.end()) {
+    std::string error;
+    CephXAuthorizeChallenge ch;
+    decode_decrypt_enc_bl(cct, ch, session_key, challenge, error);
+    if (!error.empty()) {
+      ldout(cct, 0) << "failed to decrypt challenge (" << challenge.length() << " bytes): "
+		    << error << dendl;
+      return false;
+    }
+    msg.have_challenge = true;
+    msg.server_challenge_plus_one = ch.server_challenge + 1;
+  }
+
+  std::string error;
+  if (encode_encrypt(cct, msg, session_key, bl, error)) {
+    ldout(cct, 0) << __func__ << " failed to encrypt authorizer: " << error << dendl;
+    return false;
+  }
+  return true;
+}

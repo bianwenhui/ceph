@@ -262,6 +262,8 @@ TEST_P(StoreTest, FiemapEmpty) {
 
 TEST_P(StoreTest, FiemapHoles) {
   ObjectStore::Sequencer osr("test");
+  const uint64_t MAX_EXTENTS = 4000;
+  const uint64_t SKIP_STEP = 65536;
   coll_t cid;
   int r = 0;
   ghobject_t oid(hobject_t(sobject_t("fiemap_object", CEPH_NOSNAP)));
@@ -271,27 +273,54 @@ TEST_P(StoreTest, FiemapHoles) {
     ObjectStore::Transaction t;
     t.create_collection(cid, 0);
     t.touch(cid, oid);
-    t.write(cid, oid, 0, 3, bl);
-    t.write(cid, oid, 1048576, 3, bl);
-    t.write(cid, oid, 4194304, 3, bl);
+    for (uint64_t i = 0; i < MAX_EXTENTS; i++)
+      t.write(cid, oid, SKIP_STEP * i, 3, bl);
     r = apply_transaction(store, &osr, std::move(t));
     ASSERT_EQ(r, 0);
   }
   {
+    //fiemap test from 0 to SKIP_STEP * (MAX_EXTENTS - 1) + 3
     bufferlist bl;
-    store->fiemap(cid, oid, 0, 4194307, bl);
+    store->fiemap(cid, oid, 0, SKIP_STEP * (MAX_EXTENTS - 1) + 3, bl);
     map<uint64_t,uint64_t> m, e;
     bufferlist::iterator p = bl.begin();
     ::decode(m, p);
     cout << " got " << m << std::endl;
     ASSERT_TRUE(!m.empty());
     ASSERT_GE(m[0], 3u);
-    ASSERT_TRUE((m.size() == 1 &&
-		 m[0] > 4194304u) ||
-		(m.size() == 3 &&
-		 m.count(0) &&
-		 m.count(1048576) &&
-		 m.count(4194304)));
+    auto last = m.crbegin();
+    if (m.size() == 1) {
+      ASSERT_EQ(0u, last->first);
+    } else if (m.size() == MAX_EXTENTS) {
+      for (uint64_t i = 0; i < MAX_EXTENTS; i++) {
+        ASSERT_TRUE(m.count(SKIP_STEP * i));
+      }
+    }
+    ASSERT_GT(last->first + last->second, SKIP_STEP * (MAX_EXTENTS - 1));
+  }
+  {
+    // fiemap test from SKIP_STEP to SKIP_STEP * (MAX_EXTENTS - 2) + 3
+    bufferlist bl;
+    store->fiemap(cid, oid, SKIP_STEP, SKIP_STEP * (MAX_EXTENTS - 2) + 3, bl);
+    map<uint64_t,uint64_t> m, e;
+    auto p = bl.begin();
+    ::decode(m, p);
+    cout << " got " << m << std::endl;
+    ASSERT_TRUE(!m.empty());
+    // kstore always returns [0, object_size] regardless of offset and length
+    // FIXME: if fiemap logic in kstore is refined
+    if (string(GetParam()) != "kstore") {
+      ASSERT_GE(m[SKIP_STEP], 3u);
+      auto last = m.crbegin();
+      if (m.size() == 1) {
+        ASSERT_EQ(SKIP_STEP, last->first);
+      } else if (m.size() == MAX_EXTENTS - 2) {
+        for (uint64_t i = 1; i < MAX_EXTENTS - 1; i++) {
+	  ASSERT_TRUE(m.count(SKIP_STEP*i));
+	}
+      }
+      ASSERT_GT(last->first + last->second, SKIP_STEP * (MAX_EXTENTS - 1));
+    }
   }
   {
     ObjectStore::Transaction t;
@@ -3653,8 +3682,7 @@ INSTANTIATE_TEST_CASE_P(
   ::testing::Values(
     "memstore",
     "filestore",
-    "bluestore",
-    "kstore"));
+    "bluestore"));
 
 #else
 
@@ -3673,7 +3701,8 @@ int main(int argc, char **argv) {
   argv_to_vec(argc, (const char **)argv, args);
   env_to_vec(args);
 
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
+  auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,
+			 CODE_ENVIRONMENT_UTILITY, 0);
   common_init_finish(g_ceph_context);
   g_ceph_context->_conf->set_val("osd_journal_size", "400");
   g_ceph_context->_conf->set_val("filestore_index_retry_probability", "0.5");
@@ -3691,9 +3720,7 @@ int main(int argc, char **argv) {
   g_ceph_context->_conf->apply_changes(NULL);
 
   ::testing::InitGoogleTest(&argc, argv);
-  int r = RUN_ALL_TESTS();
-  g_ceph_context->put();
-  return r;
+  return RUN_ALL_TESTS();
 }
 
 /*

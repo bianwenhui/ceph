@@ -1,6 +1,9 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include "include/compat.h"
+#include <mutex>
+
 #include <curl/curl.h>
 #include <curl/easy.h>
 #include <curl/multi.h>
@@ -72,6 +75,135 @@ struct rgw_http_req_data : public RefCountedObject {
   }
 };
 
+struct RGWCurlHandle {
+  int uses;
+  mono_time lastuse;
+  CURL* h;
+
+  RGWCurlHandle(CURL* h) : uses(0), h(h) {};
+  CURL* operator*() {
+    return this->h;
+  }
+};
+
+#define MAXIDLE 5
+class RGWCurlHandles : public Thread {
+public:
+  Mutex cleaner_lock;
+  std::vector<RGWCurlHandle*>saved_curl;
+  int cleaner_shutdown;
+  Cond cleaner_cond;
+
+  RGWCurlHandles() :
+    cleaner_lock{"RGWCurlHandles::cleaner_lock"},
+    cleaner_shutdown{0} {
+  }
+
+  RGWCurlHandle* get_curl_handle();
+  void release_curl_handle_now(RGWCurlHandle* curl);
+  void release_curl_handle(RGWCurlHandle* curl);
+  void flush_curl_handles();
+  void* entry();
+  void stop();
+};
+
+RGWCurlHandle* RGWCurlHandles::get_curl_handle() {
+  RGWCurlHandle* curl = 0;
+  CURL* h;
+  {
+    Mutex::Locker lock(cleaner_lock);
+    if (!saved_curl.empty()) {
+      curl = *saved_curl.begin();
+      saved_curl.erase(saved_curl.begin());
+    }
+  }
+  if (curl) {
+  } else if ((h = curl_easy_init())) {
+    curl = new RGWCurlHandle{h};
+  } else {
+    // curl = 0;
+  }
+  return curl;
+}
+
+void RGWCurlHandles::release_curl_handle_now(RGWCurlHandle* curl)
+{
+  curl_easy_cleanup(**curl);
+  delete curl;
+}
+
+void RGWCurlHandles::release_curl_handle(RGWCurlHandle* curl)
+{
+  if (cleaner_shutdown) {
+    release_curl_handle_now(curl);
+  } else {
+    curl_easy_reset(**curl);
+    Mutex::Locker lock(cleaner_lock);
+    curl->lastuse = mono_clock::now();
+    saved_curl.insert(saved_curl.begin(), 1, curl);
+  }
+}
+
+void* RGWCurlHandles::entry()
+{
+  RGWCurlHandle* curl;
+  Mutex::Locker lock(cleaner_lock);
+
+  for (;;) {
+    if (cleaner_shutdown) {
+      if (saved_curl.empty())
+        break;
+    } else {
+      utime_t release = ceph_clock_now(g_ceph_context) + utime_t(MAXIDLE,0);
+      cleaner_cond.WaitUntil(cleaner_lock, release);
+    }
+    mono_time now = mono_clock::now();
+    while (!saved_curl.empty()) {
+      auto cend = saved_curl.end();
+      --cend;
+      curl = *cend;
+      if (!cleaner_shutdown && now - curl->lastuse < std::chrono::seconds(MAXIDLE))
+        break;
+      saved_curl.erase(cend);
+      release_curl_handle_now(curl);
+    }
+  }
+  return nullptr;
+}
+
+void RGWCurlHandles::stop()
+{
+  Mutex::Locker lock(cleaner_lock);
+  cleaner_shutdown = 1;
+  cleaner_cond.Signal();
+}
+
+void RGWCurlHandles::flush_curl_handles()
+{
+  stop();
+  join();
+  if (!saved_curl.empty()) {
+    dout(0) << "ERROR: " << __func__ << " failed final cleanup" << dendl;
+  }
+  saved_curl.shrink_to_fit();
+}
+
+static RGWCurlHandles *handles;
+// XXX make this part of the token cache?  (but that's swift-only;
+//	and this especially needs to integrates with s3...)
+
+void rgw_setup_saved_curl_handles()
+{
+  handles = new RGWCurlHandles();
+  handles->create("rgw_curl");
+}
+
+void rgw_release_all_curl_handles()
+{
+  handles->flush_curl_handles();
+  delete handles;
+}
+
 /*
  * the simple set of callbacks will be called on RGWHTTPClient::process()
  */
@@ -109,6 +241,7 @@ static size_t simple_send_http_data(void *ptr, size_t size, size_t nmemb, void *
 
   return ret;
 }
+
 
 /*
  * the following set of callbacks will be called either on RGWHTTPManager::process(),
@@ -170,11 +303,11 @@ static size_t send_http_data(void *ptr, size_t size, size_t nmemb, void *_info)
   return ret;
 }
 
-static curl_slist *headers_to_slist(list<pair<string, string> >& headers)
+static curl_slist *headers_to_slist(param_vec_t& headers)
 {
   curl_slist *h = NULL;
 
-  list<pair<string, string> >::iterator iter;
+  param_vec_t::iterator iter;
   for (iter = headers.begin(); iter != headers.end(); ++iter) {
     pair<string, string>& p = *iter;
     string val = p.first;
@@ -200,6 +333,14 @@ static curl_slist *headers_to_slist(list<pair<string, string> >& headers)
   return h;
 }
 
+static bool is_upload_request(const char *method)
+{
+  if (method == nullptr) {
+    return false;
+  }
+  return strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0;
+}
+
 /*
  * process a single simple one off request, not going through RGWHTTPManager. Not using
  * req_data.
@@ -214,7 +355,8 @@ int RGWHTTPClient::process(const char *method, const char *url)
   last_method = (method ? method : "");
   last_url = (url ? url : "");
 
-  curl_handle = curl_easy_init();
+  auto ca = handles->get_curl_handle();
+  curl_handle = **ca;
 
   dout(20) << "sending request to " << url << dendl;
 
@@ -234,7 +376,9 @@ int RGWHTTPClient::process(const char *method, const char *url)
   }
   curl_easy_setopt(curl_handle, CURLOPT_READFUNCTION, simple_send_http_data);
   curl_easy_setopt(curl_handle, CURLOPT_READDATA, (void *)this);
-  curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 1L); 
+  if (is_upload_request(method)) {
+    curl_easy_setopt(curl_handle, CURLOPT_UPLOAD, 1L);
+  }
   if (has_send_len) {
     curl_easy_setopt(curl_handle, CURLOPT_INFILESIZE, (void *)send_len); 
   }
@@ -250,7 +394,7 @@ int RGWHTTPClient::process(const char *method, const char *url)
     ret = -EINVAL;
   }
   curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &http_status);
-  curl_easy_cleanup(curl_handle);
+  handles->release_curl_handle(ca);
   curl_slist_free_all(h);
 
   return ret;
@@ -310,7 +454,9 @@ int RGWHTTPClient::init_request(const char *method, const char *url, rgw_http_re
   }
   curl_easy_setopt(easy_handle, CURLOPT_READFUNCTION, send_http_data);
   curl_easy_setopt(easy_handle, CURLOPT_READDATA, (void *)req_data);
-  curl_easy_setopt(easy_handle, CURLOPT_UPLOAD, 1L); 
+  if (is_upload_request(method)) {
+    curl_easy_setopt(easy_handle, CURLOPT_UPLOAD, 1L);
+  }
   if (has_send_len) {
     curl_easy_setopt(easy_handle, CURLOPT_INFILESIZE, (void *)send_len); 
   }
@@ -344,7 +490,81 @@ RGWHTTPClient::~RGWHTTPClient()
 }
 
 
+static int clear_signal(int fd)
+{
+  // since we're in non-blocking mode, we can try to read a lot more than
+  // one signal from signal_thread() to avoid later wakeups. non-blocking reads
+  // are also required to support the curl_multi_wait bug workaround
+  std::array<char, 256> buf;
+  int ret = ::read(fd, (void *)buf.data(), buf.size());
+  if (ret < 0) {
+    ret = -errno;
+    return ret == -EAGAIN ? 0 : ret; // clear EAGAIN
+  }
+  return 0;
+}
+
 #if HAVE_CURL_MULTI_WAIT
+
+static std::once_flag detect_flag;
+static bool curl_multi_wait_bug_present = false;
+
+static int detect_curl_multi_wait_bug(CephContext *cct, CURLM *handle,
+                                      int write_fd, int read_fd)
+{
+  int ret = 0;
+
+  // write to write_fd so that read_fd becomes readable
+  uint32_t buf = 0;
+  ret = ::write(write_fd, &buf, sizeof(buf));
+  if (ret < 0) {
+    ret = -errno;
+    ldout(cct, 0) << "ERROR: " << __func__ << "(): write() returned " << ret << dendl;
+    return ret;
+  }
+
+  // pass read_fd in extra_fds for curl_multi_wait()
+  int num_fds;
+  struct curl_waitfd wait_fd;
+
+  wait_fd.fd = read_fd;
+  wait_fd.events = CURL_WAIT_POLLIN;
+  wait_fd.revents = 0;
+
+  ret = curl_multi_wait(handle, &wait_fd, 1, 0, &num_fds);
+  if (ret != CURLM_OK) {
+    ldout(cct, 0) << "ERROR: curl_multi_wait() returned " << ret << dendl;
+    return -EIO;
+  }
+
+  // curl_multi_wait should flag revents when extra_fd is readable. if it
+  // doesn't, the bug is present and we can't rely on revents
+  if (wait_fd.revents == 0) {
+    curl_multi_wait_bug_present = true;
+    ldout(cct, 0) << "WARNING: detected a version of libcurl which contains a "
+        "bug in curl_multi_wait(). enabling a workaround that may degrade "
+        "performance slightly." << dendl;
+  }
+
+  return clear_signal(read_fd);
+}
+
+static bool is_signaled(const curl_waitfd& wait_fd)
+{
+  if (wait_fd.fd < 0) {
+    // no fd to signal
+    return false;
+  }
+
+  if (curl_multi_wait_bug_present) {
+    // we can't rely on revents, so we always return true if a wait_fd is given.
+    // this means we'll be trying a non-blocking read on this fd every time that
+    // curl_multi_wait() wakes up
+    return true;
+  }
+
+  return wait_fd.revents > 0;
+}
 
 static int do_curl_wait(CephContext *cct, CURLM *handle, int signal_fd)
 {
@@ -357,16 +577,14 @@ static int do_curl_wait(CephContext *cct, CURLM *handle, int signal_fd)
 
   int ret = curl_multi_wait(handle, &wait_fd, 1, cct->_conf->rgw_curl_wait_timeout_ms, &num_fds);
   if (ret) {
-    dout(0) << "ERROR: curl_multi_wait() returned " << ret << dendl;
+    ldout(cct, 0) << "ERROR: curl_multi_wait() returned " << ret << dendl;
     return -EIO;
   }
 
-  if (wait_fd.revents > 0) {
-    uint32_t buf;
-    ret = read(signal_fd, (void *)&buf, sizeof(buf));
+  if (is_signaled(wait_fd)) {
+    ret = clear_signal(signal_fd);
     if (ret < 0) {
-      ret = -errno;
-      dout(0) << "ERROR: " << __func__ << "(): read() returned " << ret << dendl;
+      ldout(cct, 0) << "ERROR: " << __func__ << "(): read() returned " << ret << dendl;
       return ret;
     }
   }
@@ -389,12 +607,15 @@ static int do_curl_wait(CephContext *cct, CURLM *handle, int signal_fd)
   /* get file descriptors from the transfers */ 
   int ret = curl_multi_fdset(handle, &fdread, &fdwrite, &fdexcep, &maxfd);
   if (ret) {
-    generic_dout(0) << "ERROR: curl_multi_fdset returned " << ret << dendl;
+    ldout(cct, 0) << "ERROR: curl_multi_fdset returned " << ret << dendl;
     return -EIO;
   }
 
-  if (signal_fd >= maxfd) {
-    maxfd = signal_fd + 1;
+  if (signal_fd > 0) {
+    FD_SET(signal_fd, &fdread);
+    if (signal_fd >= maxfd) {
+      maxfd = signal_fd + 1;
+    }
   }
 
   /* forcing a strict timeout, as the returned fdsets might not reference all fds we wait on */
@@ -409,16 +630,14 @@ static int do_curl_wait(CephContext *cct, CURLM *handle, int signal_fd)
   ret = select(maxfd+1, &fdread, &fdwrite, &fdexcep, &timeout);
   if (ret < 0) {
     ret = -errno;
-    dout(0) << "ERROR: select returned " << ret << dendl;
+    ldout(cct, 0) << "ERROR: select returned " << ret << dendl;
     return ret;
   }
 
   if (signal_fd > 0 && FD_ISSET(signal_fd, &fdread)) {
-    uint32_t buf;
-    ret = read(signal_fd, (void *)&buf, sizeof(buf));
+    ret = clear_signal(signal_fd);
     if (ret < 0) {
-      ret = -errno;
-      dout(0) << "ERROR: " << __func__ << "(): read() returned " << ret << dendl;
+      ldout(cct, 0) << "ERROR: " << __func__ << "(): read() returned " << ret << dendl;
       return ret;
     }
   }
@@ -707,16 +926,34 @@ int RGWHTTPManager::complete_requests()
 
 int RGWHTTPManager::set_threaded()
 {
-  is_threaded = true;
-  reqs_thread = new ReqsThread(this);
-  reqs_thread->create("http_manager");
-
   int r = pipe(thread_pipe);
   if (r < 0) {
     r = -errno;
     ldout(cct, 0) << "ERROR: pipe() returned errno=" << r << dendl;
     return r;
   }
+
+  // enable non-blocking reads
+  r = ::fcntl(thread_pipe[0], F_SETFL, O_NONBLOCK);
+  if (r < 0) {
+    r = -errno;
+    ldout(cct, 0) << "ERROR: fcntl() returned errno=" << r << dendl;
+    TEMP_FAILURE_RETRY(::close(thread_pipe[0]));
+    TEMP_FAILURE_RETRY(::close(thread_pipe[1]));
+    return r;
+  }
+
+#ifdef HAVE_CURL_MULTI_WAIT
+  // on first initialization, use this pipe to detect whether we're using a
+  // buggy version of libcurl
+  std::call_once(detect_flag, detect_curl_multi_wait_bug, cct,
+                 static_cast<CURLM*>(multi_handle),
+                 thread_pipe[1], thread_pipe[0]);
+#endif
+
+  is_threaded = true;
+  reqs_thread = new ReqsThread(this);
+  reqs_thread->create("http_manager");
   return 0;
 }
 
@@ -733,6 +970,8 @@ void RGWHTTPManager::stop()
     signal_thread();
     reqs_thread->join();
     delete reqs_thread;
+    TEMP_FAILURE_RETRY(::close(thread_pipe[1]));
+    TEMP_FAILURE_RETRY(::close(thread_pipe[0]));
   }
 }
 

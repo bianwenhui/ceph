@@ -3,7 +3,6 @@ ceph_dencoder_SOURCES = \
 	test/encoding/ceph_dencoder.cc \
 	$(DENCODER_SOURCES)
 ceph_dencoder_LDADD = \
-	$(LIBRGW) \
 	$(LIBRADOS) \
 	$(LIBRBD_TYPES) \
 	$(LIBOSD_TYPES) \
@@ -26,6 +25,9 @@ ceph_dencoder_CXXFLAGS += -DWITH_RBD
 endif
 if WITH_RADOSGW
 ceph_dencoder_CXXFLAGS += -DWITH_RADOSGW
+ceph_dencoder_LDADD += \
+	$(LIBRGW) \
+	$(LIBRGW_DEPS) 
 endif
 
 
@@ -38,6 +40,7 @@ if WITH_RADOS
 
 libradostest_la_SOURCES = \
 	test/librados/test.cc \
+	test/librados/test_common.cc \
 	test/librados/TestCase.cc
 noinst_LTLIBRARIES += libradostest.la
 libradostest_la_CXXFLAGS = $(UNITTEST_CXXFLAGS)
@@ -383,14 +386,21 @@ librbd_test_mock_la_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 noinst_LTLIBRARIES += librbd_test_mock.la
 
 unittest_librbd_SOURCES = \
+        test/librbd/test_BlockGuard.cc \
         test/librbd/test_main.cc \
 	test/librbd/test_mock_fixture.cc \
+	test/librbd/test_mock_AioImageRequest.cc \
+	test/librbd/test_mock_AioImageRequestWQ.cc \
 	test/librbd/test_mock_ExclusiveLock.cc \
 	test/librbd/test_mock_Journal.cc \
 	test/librbd/test_mock_ObjectWatcher.cc \
 	test/librbd/exclusive_lock/test_mock_AcquireRequest.cc \
+	test/librbd/exclusive_lock/test_mock_BreakRequest.cc \
+	test/librbd/exclusive_lock/test_mock_GetLockerRequest.cc \
+	test/librbd/exclusive_lock/test_mock_ReacquireRequest.cc \
 	test/librbd/exclusive_lock/test_mock_ReleaseRequest.cc \
 	test/librbd/image/test_mock_RefreshRequest.cc \
+	test/librbd/image_watcher/test_mock_RewatchRequest.cc \
 	test/librbd/journal/test_mock_Replay.cc \
 	test/librbd/object_map/test_mock_InvalidateRequest.cc \
 	test/librbd/object_map/test_mock_LockRequest.cc \
@@ -433,10 +443,11 @@ bin_DEBUGPROGRAMS += ceph_test_librbd
 ceph_test_librbd_api_SOURCES = \
 	test/librbd/test_support.cc \
 	test/librbd/test_librbd.cc \
-	test/librbd/test_main.cc
+	test/librbd/test_main.cc \
+	test/librados/test.cc
 ceph_test_librbd_api_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 ceph_test_librbd_api_LDADD = \
-	$(LIBRBD) $(LIBRADOS) $(LIBCOMMON) $(UNITTEST_LDADD) $(RADOS_TEST_LDADD)
+	$(LIBRBD) $(LIBRADOS) $(UNITTEST_LDADD)
 bin_DEBUGPROGRAMS += ceph_test_librbd_api
 
 noinst_HEADERS += \
@@ -476,8 +487,10 @@ unittest_rbd_mirror_SOURCES = \
 	test/rbd_mirror/test_mock_fixture.cc \
 	test/rbd_mirror/test_mock_ImageReplayer.cc \
 	test/rbd_mirror/test_mock_ImageSync.cc \
+	test/rbd_mirror/test_mock_ImageSyncThrottler.cc \
 	test/rbd_mirror/image_replayer/test_mock_BootstrapRequest.cc \
 	test/rbd_mirror/image_replayer/test_mock_CreateImageRequest.cc \
+	test/rbd_mirror/image_replayer/test_mock_EventPreprocessor.cc \
 	test/rbd_mirror/image_sync/test_mock_ImageCopyRequest.cc \
 	test/rbd_mirror/image_sync/test_mock_ObjectCopyRequest.cc \
 	test/rbd_mirror/image_sync/test_mock_SnapshotCopyRequest.cc \
@@ -528,22 +541,6 @@ ceph_test_rbd_mirror_random_write_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 ceph_test_rbd_mirror_random_write_LDADD = \
 	$(LIBRBD) $(LIBRADOS) $(CEPH_GLOBAL)
 bin_DEBUGPROGRAMS += ceph_test_rbd_mirror_random_write
-
-ceph_test_rbd_mirror_image_replay_SOURCES = \
-	test/rbd_mirror/image_replay.cc
-ceph_test_rbd_mirror_image_replay_LDADD = \
-	librbd_mirror_internal.la \
-	librbd_internal.la \
-	librbd_api.la \
-	$(LIBRBD_TYPES) \
-	libjournal.la \
-	$(LIBRADOS) $(LIBOSDC) \
-	librados_internal.la \
-	libcls_rbd_client.la \
-	libcls_lock_client.la \
-	libcls_journal_client.la \
-	$(CEPH_GLOBAL)
-bin_DEBUGPROGRAMS += ceph_test_rbd_mirror_image_replay
 
 if LINUX
 ceph_test_librbd_fsx_SOURCES = test/librbd/fsx.cc

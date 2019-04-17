@@ -252,21 +252,11 @@ private:
 public:
   void encode(bufferlist& bl) const {
     ::encode(held_locks, bl);
-    ::encode(waiting_locks, bl);
     ::encode(client_held_lock_counts, bl);
-    ::encode(client_waiting_lock_counts, bl);
   }
   void decode(bufferlist::iterator& bl) {
     ::decode(held_locks, bl);
-    ::decode(waiting_locks, bl);
     ::decode(client_held_lock_counts, bl);
-    ::decode(client_waiting_lock_counts, bl);
-  }
-  void clear() {
-    held_locks.clear();
-    waiting_locks.clear();
-    client_held_lock_counts.clear();
-    client_waiting_lock_counts.clear();
   }
   bool empty() const {
     return held_locks.empty() && waiting_locks.empty() &&
@@ -277,18 +267,18 @@ public:
 WRITE_CLASS_ENCODER(ceph_lock_state_t)
 
 
-inline ostream& operator<<(ostream& out, ceph_lock_state_t& l) {
+inline ostream& operator<<(ostream &out, const ceph_lock_state_t &l) {
   out << "ceph_lock_state_t. held_locks.size()=" << l.held_locks.size()
       << ", waiting_locks.size()=" << l.waiting_locks.size()
       << ", client_held_lock_counts -- " << l.client_held_lock_counts
       << "\n client_waiting_lock_counts -- " << l.client_waiting_lock_counts
       << "\n held_locks -- ";
-    for (multimap<uint64_t, ceph_filelock>::iterator iter = l.held_locks.begin();
+    for (auto iter = l.held_locks.begin();
          iter != l.held_locks.end();
          ++iter)
       out << iter->second;
     out << "\n waiting_locks -- ";
-    for (multimap<uint64_t, ceph_filelock>::iterator iter =l.waiting_locks.begin();
+    for (auto iter =l.waiting_locks.begin();
          iter != l.waiting_locks.end();
          ++iter)
       out << iter->second << "\n";

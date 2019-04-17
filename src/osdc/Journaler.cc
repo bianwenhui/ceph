@@ -74,7 +74,11 @@ void Journaler::_set_layout(file_layout_t const *l)
 {
   layout = *l;
 
-  assert(layout.pool_id == pg_pool);
+  if (layout.pool_id != pg_pool) {
+    // user can reset pool id through cephfs-journal-tool
+    lderr(cct) << "may got older pool id from header layout" << dendl;
+    ceph_abort();
+  }
   last_written.layout = layout;
   last_committed.layout = layout;
 
@@ -89,7 +93,7 @@ void Journaler::_set_layout(file_layout_t const *l)
 
 /***************** HEADER *******************/
 
-ostream& operator<<(ostream& out, Journaler::Header &h)
+ostream& operator<<(ostream &out, const Journaler::Header &h)
 {
   return out << "loghead(trim " << h.trimmed_pos
 	     << ", expire " << h.expire_pos
@@ -528,7 +532,7 @@ void Journaler::_finish_flush(int r, uint64_t start, ceph::real_time stamp)
 
 uint64_t Journaler::append_entry(bufferlist& bl)
 {
-  lock_guard l(lock);
+  unique_lock l(lock);
 
   assert(!readonly);
   uint32_t s = bl.length();
@@ -547,6 +551,15 @@ uint64_t Journaler::append_entry(bufferlist& bl)
       bufferptr bp(write_pos - owp);
       bp.zero();
       assert(bp.length() >= 4);
+      if (!write_buf_throttle.get_or_fail(bp.length())) {
+        l.unlock();
+        ldout(cct, 10) << "write_buf_throttle wait, bp len " 
+                       << bp.length() << dendl;
+        write_buf_throttle.get(bp.length());
+        l.lock();
+      }
+      ldout(cct, 20) << "write_buf_throttle get, bp len " 
+                     << bp.length() << dendl;
       write_buf.push_back(bp);
 
       // now flush.
@@ -560,6 +573,15 @@ uint64_t Journaler::append_entry(bufferlist& bl)
 
 
   // append
+  size_t delta = bl.length() + journal_stream.get_envelope_size();
+  // write_buf space is nearly full
+  if (!write_buf_throttle.get_or_fail(delta)) {
+    l.unlock();
+    ldout(cct, 10) << "write_buf_throttle wait, delta " << delta << dendl;
+    write_buf_throttle.get(delta);
+    l.lock();
+  }
+  ldout(cct, 20) << "write_buf_throttle get, delta " << delta << dendl;
   size_t wrote = journal_stream.write(bl, &write_buf, write_pos);
   ldout(cct, 10) << "append_entry len " << s << " to " << write_pos << "~"
 		 << wrote << dendl;
@@ -589,7 +611,7 @@ void Journaler::_do_flush(unsigned amount)
   assert(!readonly);
 
   // flush
-  unsigned len = write_pos - flush_pos;
+  uint64_t len = write_pos - flush_pos;
   assert(len == write_buf.length());
   if (amount && amount < len)
     len = amount;
@@ -605,19 +627,16 @@ void Journaler::_do_flush(unsigned amount)
       ldout(cct, 10) << "_do_flush wanted to do " << flush_pos << "~" << len
 		     << " already too close to prezero_pos " << prezero_pos
 		     << ", zeroing first" << dendl;
-      waiting_for_zero = true;
+      waiting_for_zero_pos = flush_pos + len;
       return;
     }
     if (newlen < len) {
       ldout(cct, 10) << "_do_flush wanted to do " << flush_pos << "~" << len
 		     << " but hit prezero_pos " << prezero_pos
 		     << ", will do " << flush_pos << "~" << newlen << dendl;
+      waiting_for_zero_pos = flush_pos + len;
       len = newlen;
-    } else {
-      waiting_for_zero = false;
     }
-  } else {
-    waiting_for_zero = false;
   }
   ldout(cct, 10) << "_do_flush flushing " << flush_pos << "~" << len << dendl;
 
@@ -645,7 +664,9 @@ void Journaler::_do_flush(unsigned amount)
 
   flush_pos += len;
   assert(write_buf.length() == write_pos - flush_pos);
-
+  write_buf_throttle.put(len);
+  ldout(cct, 20) << "write_buf_throttle put, len " << len << dendl;
+ 
   ldout(cct, 10)
     << "_do_flush (prezeroing/prezero)/write/flush/safe pointers now at "
     << "(" << prezeroing_pos << "/" << prezero_pos << ")/" << write_pos
@@ -815,8 +836,8 @@ void Journaler::_finish_prezero(int r, uint64_t start, uint64_t len)
       pending_zero.erase(b);
     }
 
-    if (waiting_for_zero) {
-      _do_flush();
+    if (waiting_for_zero_pos > flush_pos) {
+      _do_flush(waiting_for_zero_pos - flush_pos);
     }
   } else {
     pending_zero.insert(start, len);
@@ -1492,7 +1513,7 @@ void Journaler::shutdown()
     f->complete(-EAGAIN);
   }
 
-  finish_contexts(cct, waitfor_recover, 0);
+  finish_contexts(cct, waitfor_recover, -ESHUTDOWN);
 
   std::map<uint64_t, std::list<Context*> >::iterator i;
   for (i = waitfor_safe.begin(); i != waitfor_safe.end(); ++i) {

@@ -1718,6 +1718,8 @@ public:
       data.ops++;
     }
 
+    /// Set allocation hint for an object
+    /// make 0 values(expected_object_size, expected_write_size) noops for all implementations
     void set_alloc_hint(
       coll_t cid,
       const ghobject_t &oid,
@@ -2409,6 +2411,8 @@ public:
   // DEBUG
   virtual void inject_data_error(const ghobject_t &oid) {}
   virtual void inject_mdata_error(const ghobject_t &oid) {}
+
+  virtual void compact() {}
 };
 WRITE_CLASS_ENCODER(ObjectStore::Transaction)
 WRITE_CLASS_ENCODER(ObjectStore::Transaction::TransactionData)

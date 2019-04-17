@@ -5,11 +5,13 @@ require {
 	type var_run_t;
 	type random_device_t;
 	type urandom_device_t;
-        type setfiles_t;
+	type setfiles_t;
+	type nvme_device_t;
 	class sock_file unlink;
 	class lnk_file read;
 	class dir read;
 	class file { getattr read open };
+	class blk_file { getattr ioctl open read write };
 }
 
 ########################################
@@ -83,14 +85,17 @@ logging_send_syslog_msg(ceph_t)
 
 sysnet_dns_name_resolve(ceph_t)
 
+allow ceph_t nvme_device_t:blk_file { getattr ioctl open read write };
+
 # basis for future security review
-allow ceph_t ceph_var_run_t:sock_file { create unlink write };
-allow ceph_t self:capability sys_rawio;
+allow ceph_t ceph_var_run_t:sock_file { create unlink write setattr };
+allow ceph_t self:capability { sys_rawio chown };
 
 allow ceph_t self:tcp_socket { accept listen };
 corenet_tcp_connect_cyphesis_port(ceph_t)
 corenet_tcp_connect_generic_port(ceph_t)
 files_list_tmp(ceph_t)
+files_manage_generic_tmp_files(ceph_t)
 fstools_exec(ceph_t)
 nis_use_ypbind_uncond(ceph_t)
 storage_raw_rw_fixed_disk(ceph_t)

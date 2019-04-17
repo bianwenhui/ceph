@@ -2,6 +2,7 @@
 #include "include/rados/librados.hpp"
 #include "test/librados/test.h"
 #include "test/librados/TestCase.h"
+#include "test/unit.h"
 #include "include/encoding.h"
 #include "tools/cephfs/DataScan.h"
 #include "global/global_init.h"
@@ -16,10 +17,6 @@ using namespace librados;
 typedef RadosTestPP TmapMigratePP;
 
 TEST_F(TmapMigratePP, DataScan) {
-  std::vector<const char *> args;
-  global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
-  common_init_finish(g_ceph_context);
-
   // DataScan isn't namespace-aware, so override RadosTestPP's default
   // behaviour of putting everything into a namespace
   ioctx.set_namespace("");
@@ -48,7 +45,6 @@ TEST_F(TmapMigratePP, DataScan) {
   ASSERT_EQ(0, ds.init());
   int r = ds.main({"tmap_upgrade", pool_name.c_str()});
   ASSERT_EQ(r, 0);
-  ds.shutdown();
 
   // Check that the TMAP object is now an omap object
   std::map<std::string, bufferlist> read_vals;

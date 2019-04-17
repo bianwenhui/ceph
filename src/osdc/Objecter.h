@@ -335,13 +335,20 @@ struct ObjectOperation {
     void finish(int r) {
       bufferlist::iterator iter = bl.begin();
       if (r >= 0) {
-	try {
-	  ::decode(*extents, iter);
-	  ::decode(*data_bl, iter);
-	} catch (buffer::error& e) {
-	  if (prval)
-	    *prval = -EIO;
-	}
+        // NOTE: it's possible the sub-op has not been executed but the result
+        // code remains zeroed. Avoid the costly exception handling on a
+        // potential IO path.
+        if (bl.length() > 0) {
+	  try {
+	    ::decode(*extents, iter);
+	    ::decode(*data_bl, iter);
+	  } catch (buffer::error& e) {
+	    if (prval)
+              *prval = -EIO;
+	  }
+        } else if (prval) {
+          *prval = -EIO;
+        }
       }
     }
   };
@@ -1973,7 +1980,7 @@ private:
   ~Objecter();
 
   void init();
-  void start();
+  void start(const OSDMap *o = nullptr);
   void shutdown();
 
   // These two templates replace osdmap_(get)|(put)_read. Simply wrap
@@ -2057,7 +2064,9 @@ private:
     }
   }
   void ms_fast_dispatch(Message *m) {
-    ms_dispatch(m);
+    if (!ms_dispatch(m)) {
+      m->put();
+    }
   }
 
   void handle_osd_op_reply(class MOSDOpReply *m);
@@ -2133,6 +2142,7 @@ private:
   int _op_cancel(ceph_tid_t tid, int r);
 public:
   int op_cancel(ceph_tid_t tid, int r);
+  int op_cancel(const vector<ceph_tid_t>& tidls, int r);
 
   /**
    * Any write op which is in progress at the start of this call shall no

@@ -3717,6 +3717,10 @@ extern "C" int rados_getxattrs_next(rados_xattrs_iter_t iter,
 {
   tracepoint(librados, rados_getxattrs_next_enter, iter);
   librados::RadosXattrsIter *it = static_cast<librados::RadosXattrsIter*>(iter);
+  if (it->val) {
+    free(it->val);
+    it->val = NULL;
+  }
   if (it->i == it->attrset.end()) {
     *name = NULL;
     *val = NULL;
@@ -3724,7 +3728,6 @@ extern "C" int rados_getxattrs_next(rados_xattrs_iter_t iter,
     tracepoint(librados, rados_getxattrs_next_exit, 0, NULL, NULL, 0);
     return 0;
   }
-  free(it->val);
   const std::string &s(it->i->first);
   *name = s.c_str();
   bufferlist &bl(it->i->second);
@@ -5514,7 +5517,7 @@ librados::ObjectCursor librados::IoCtx::object_list_begin()
 {
   hobject_t *h = new hobject_t(io_ctx_impl->objecter->enumerate_objects_begin());
   ObjectCursor oc;
-  oc.c_cursor = (rados_object_list_cursor)h;
+  oc.set((rados_object_list_cursor)h);
   return oc;
 }
 
@@ -5523,7 +5526,7 @@ librados::ObjectCursor librados::IoCtx::object_list_end()
 {
   hobject_t *h = new hobject_t(io_ctx_impl->objecter->enumerate_objects_end());
   librados::ObjectCursor oc;
-  oc.c_cursor = (rados_object_list_cursor)h;
+  oc.set((rados_object_list_cursor)h);
   return oc;
 }
 

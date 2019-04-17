@@ -61,6 +61,7 @@ void rgw_bucket_dir_entry_meta::dump(Formatter *f) const
   encode_json("owner_display_name", owner_display_name, f);
   encode_json("content_type", content_type, f);
   encode_json("accounted_size", accounted_size, f);
+  encode_json("user_data", user_data, f);
 }
 
 void rgw_bucket_dir_entry_meta::decode_json(JSONObj *obj) {
@@ -75,6 +76,7 @@ void rgw_bucket_dir_entry_meta::decode_json(JSONObj *obj) {
   JSONDecoder::decode_json("owner_display_name", owner_display_name, obj);
   JSONDecoder::decode_json("content_type", content_type, obj);
   JSONDecoder::decode_json("accounted_size", accounted_size, obj);
+  JSONDecoder::decode_json("user_data", user_data, obj);
 }
 
 void rgw_bucket_dir_entry::generate_test_instances(list<rgw_bucket_dir_entry*>& o)
@@ -235,6 +237,38 @@ void rgw_cls_bi_entry::dump(Formatter *f) const
   encode_json("type", type_str, f);
   encode_json("idx", idx, f);
   dump_bi_entry(data, type, f);
+}
+
+bool rgw_cls_bi_entry::get_info(cls_rgw_obj_key *key, uint8_t *category, rgw_bucket_category_stats *accounted_stats)
+{
+  bool account = false;
+  bufferlist::iterator iter = data.begin();
+  switch (type) {
+    case PlainIdx:
+    case InstanceIdx:
+      {
+        rgw_bucket_dir_entry entry;
+        ::decode(entry, iter);
+        *key = entry.key;
+        *category = entry.meta.category;
+        accounted_stats->num_entries++;
+        accounted_stats->total_size += entry.meta.accounted_size;
+        accounted_stats->total_size_rounded += cls_rgw_get_rounded_size(entry.meta.accounted_size);
+        account = true;
+      }
+      break;
+    case OLHIdx:
+      {
+        rgw_bucket_olh_entry entry;
+        ::decode(entry, iter);
+        *key = entry.key;
+      }
+      break;
+    default:
+      break;
+  }
+
+  return account;
 }
 
 void rgw_bucket_olh_entry::dump(Formatter *f) const

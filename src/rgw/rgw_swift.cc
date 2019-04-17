@@ -617,10 +617,28 @@ int authenticate_temp_url(RGWRados * const store, req_state * const s)
    * about account is neccessary to obtain its bucket tenant. Without that,
    * the access would be limited to accounts with empty tenant. */
   string bucket_tenant;
-  if (!s->account_name.empty()) {
+  if (! s->account_name.empty()) {
     RGWUserInfo uinfo;
+    const rgw_user acct_user(s->account_name);
 
-    if (rgw_get_user_info_by_uid(store, s->account_name, uinfo) < 0) {
+    ldout(s->cct, 20) << "temp url: loading RGWUserInfo for rgw_user="
+                      << acct_user << dendl;
+
+    if (acct_user.tenant.empty()) {
+      rgw_user tenanted_acct_user(acct_user);
+      tenanted_acct_user.tenant = acct_user.id;
+
+      /* The account name specified in the URL doesn't have the tenant part.
+       * This means we have to handle the special case for Keystone-created
+       * accounts when the "rgw_keystone_implicit_tenants" was turned on.
+       * For more details about this mechanism please refer to the comment
+       * in RGWSwift::update_user_info(). */
+      if (rgw_get_user_info_by_uid(store, tenanted_acct_user, uinfo) < 0) {
+        if (rgw_get_user_info_by_uid(store, acct_user, uinfo) < 0) {
+          return -EPERM;
+        }
+      }
+    } else if (rgw_get_user_info_by_uid(store, acct_user, uinfo) < 0) {
       return -EPERM;
     }
 
@@ -670,8 +688,8 @@ int authenticate_temp_url(RGWRados * const store, req_state * const s)
    * of Swift API entry point removed. */
   const size_t pos = g_conf->rgw_swift_url_prefix.find_last_not_of('/') + 1;
   const vector<string> allowed_paths = {
-    s->info.request_uri,
-    s->info.request_uri.substr(pos + 1)
+    s->decoded_uri,
+    s->decoded_uri.substr(pos + 1)
   };
 
   vector<string> allowed_methods;
@@ -808,9 +826,16 @@ void RGWSwift::init()
 void RGWSwift::init_keystone()
 {
   keystone_token_cache = new RGWKeystoneTokenCache(cct, cct->_conf->rgw_keystone_token_cache_size);
-
+  /* revocation logic needs to be smarter, but meanwhile,
+   *  make it optional.
+   * see http://tracker.ceph.com/issues/9493
+   *     http://tracker.ceph.com/issues/19499
+   */
+  if (cct->_conf->rgw_keystone_revocation_interval > 0
+    && cct->_conf->rgw_keystone_token_cache_size ) {
   keystone_revoke_thread = new KeystoneRevokeThread(cct, this);
   keystone_revoke_thread->create("rgw_swift_k_rev");
+  }
 }
 
 
